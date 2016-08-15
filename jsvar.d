@@ -61,6 +61,7 @@ module arsd.jsvar;
 version=new_std_json;
 
 import std.stdio;
+static import std.array;
 import std.traits;
 import std.conv;
 import std.json;
@@ -904,8 +905,7 @@ struct var {
 		return this.opEquals(var(t));
 	}
 
-
-	public bool opEquals(T:var)(T t) {
+	public bool opEquals(T:var)(T t) const {
 		// FIXME: should this be == or === ?
 		if(this._type != t._type)
 			return false;
@@ -1127,7 +1127,8 @@ struct var {
 		} else if(_type == Type.Object) {
 			// objects might overload opIndex
 			var* n = new var();
-			*n = this["opIndex"](idx);
+			if("opIndex" in this)
+				*n = this["opIndex"](idx);
 			return *n;
 		}
 		version(jsvar_throw)
@@ -1635,9 +1636,6 @@ WrappedNativeObject wrapNativeObject(Class)(Class obj) if(is(Class == class)) {
 						_properties[memberName] = new PropertyPrototype(
 							() => var(__traits(getMember, obj, memberName)),
 							(var v) {
-							static if(memberName == "handleCharEvent") {
-							import std.stdio; writeln("setting ", memberName, " to ", v.get!type.ptr);
-							}
 								__traits(getMember, obj, memberName) = v.get!(type);
 							});
 					}

@@ -1,3 +1,4 @@
+///
 module arsd.color;
 
 @safe:
@@ -62,19 +63,23 @@ private {
 		return ret ~ toInternal!string(amt);
 	}
 
+	nothrow @safe @nogc pure
 	real absInternal(real a) { return a < 0 ? -a : a; }
+	nothrow @safe @nogc pure
 	real minInternal(real a, real b, real c) {
 		auto m = a;
 		if(b < m) m = b;
 		if(c < m) m = c;
 		return m;
 	}
+	nothrow @safe @nogc pure
 	real maxInternal(real a, real b, real c) {
 		auto m = a;
 		if(b > m) m = b;
 		if(c > m) m = c;
 		return m;
 	}
+	nothrow @safe @nogc pure
 	bool startsWithInternal(string a, string b) {
 		return (a.length >= b.length && a[0 .. b.length] == b);
 	}
@@ -91,6 +96,7 @@ private {
 			ret ~= a[previous .. $];
 		return ret;
 	}
+	nothrow @safe @nogc pure
 	string stripInternal(string s) {
 		foreach(i, char c; s)
 			if(c != ' ' && c != '\t' && c != '\n') {
@@ -113,9 +119,16 @@ private {
 
 /// Represents an RGBA color
 struct Color {
-	union {
-		ubyte[4] components;
+@safe:
+	/++
+		The color components are available as a static array, individual bytes, and a uint inside this union.
 
+		Since it is anonymous, you can use the inner members' names directly.
+	+/
+	union {
+		ubyte[4] components; /// [r, g, b, a]
+
+		/// Holder for rgba individual components.
 		struct {
 			ubyte r; /// red
 			ubyte g; /// green
@@ -123,10 +136,13 @@ struct Color {
 			ubyte a; /// alpha. 255 == opaque
 		}
 
-		uint asUint;
+		uint asUint; /// The components as a single 32 bit value (beware of endian issues!)
 	}
 
-	// this makes sure they are in range before casting
+	/++
+		Like the constructor, but this makes sure they are in range before casting. If they are out of range, it saturates: anything less than zero becomes zero and anything greater than 255 becomes 255.
+	+/
+	nothrow pure
 	static Color fromIntegers(int red, int green, int blue, int alpha = 255) {
 		if(red < 0) red = 0; if(red > 255) red = 255;
 		if(green < 0) green = 0; if(green > 255) green = 255;
@@ -135,7 +151,8 @@ struct Color {
 		return Color(red, green, blue, alpha);
 	}
 
-	/// .
+	/// Construct a color with the given values. They should be in range 0 <= x <= 255, where 255 is maximum intensity and 0 is minimum intensity.
+	nothrow pure @nogc
 	this(int red, int green, int blue, int alpha = 255) {
 		// workaround dmd bug 10937
 		if(__ctfe)
@@ -147,22 +164,46 @@ struct Color {
 		this.a = cast(ubyte) alpha;
 	}
 
-	/// Convenience functions for common color names
+	/// Static convenience functions for common color names
+	nothrow pure @nogc
 	static Color transparent() { return Color(0, 0, 0, 0); }
-	static Color white() { return Color(255, 255, 255); } ///.
-	static Color black() { return Color(0, 0, 0); } ///.
-	static Color red() { return Color(255, 0, 0); } ///.
-	static Color green() { return Color(0, 255, 0); } ///.
-	static Color blue() { return Color(0, 0, 255); } ///.
-	static Color yellow() { return Color(255, 255, 0); } ///.
-	static Color teal() { return Color(0, 255, 255); } ///.
-	static Color purple() { return Color(255, 0, 255); } ///.
+	/// Ditto
+	nothrow pure @nogc
+	static Color white() { return Color(255, 255, 255); }
+	/// Ditto
+	nothrow pure @nogc
+	static Color black() { return Color(0, 0, 0); }
+	/// Ditto
+	nothrow pure @nogc
+	static Color red() { return Color(255, 0, 0); }
+	/// Ditto
+	nothrow pure @nogc
+	static Color green() { return Color(0, 255, 0); }
+	/// Ditto
+	nothrow pure @nogc
+	static Color blue() { return Color(0, 0, 255); }
+	/// Ditto
+	nothrow pure @nogc
+	static Color yellow() { return Color(255, 255, 0); }
+	/// Ditto
+	nothrow pure @nogc
+	static Color teal() { return Color(0, 255, 255); }
+	/// Ditto
+	nothrow pure @nogc
+	static Color purple() { return Color(255, 0, 255); }
 
 	/*
 	ubyte[4] toRgbaArray() {
 		return [r,g,b,a];
 	}
 	*/
+
+  /// Return black-and-white color
+	Color toBW() () {
+		int intens = cast(int)(0.2126*r+0.7152*g+0.0722*b);
+		if (intens < 0) intens = 0; else if (intens > 255) intens = 255;
+		return Color(intens, intens, intens, a);
+	}
 
 	/// Makes a string that matches CSS syntax for websites
 	string toCssString() {
@@ -301,6 +342,7 @@ struct Color {
 	}
 }
 
+nothrow @safe
 private string toHexInternal(ubyte b) {
 	string s;
 	if(b < 16)
@@ -321,6 +363,7 @@ private string toHexInternal(ubyte b) {
 	return s;
 }
 
+nothrow @safe @nogc pure
 private ubyte fromHexInternal(string s) {
 	int result = 0;
 
@@ -518,25 +561,28 @@ Color setLightness(Color c, real lightness) {
 }
 
 
-
+///
 Color rotateHue(Color c, real degrees) {
 	auto hsl = toHsl(c);
 	hsl[0] += degrees;
 	return fromHsl(hsl);
 }
 
+///
 Color setHue(Color c, real hue) {
 	auto hsl = toHsl(c);
 	hsl[0] = hue;
 	return fromHsl(hsl);
 }
 
+///
 Color desaturate(Color c, real percentage) {
 	auto hsl = toHsl(c);
 	hsl[1] *= (1 - percentage);
 	return fromHsl(hsl);
 }
 
+///
 Color saturate(Color c, real percentage) {
 	auto hsl = toHsl(c);
 	hsl[1] *= (1 + percentage);
@@ -545,6 +591,7 @@ Color saturate(Color c, real percentage) {
 	return fromHsl(hsl);
 }
 
+///
 Color setSaturation(Color c, real saturation) {
 	auto hsl = toHsl(c);
 	hsl[1] = saturation;
@@ -592,6 +639,7 @@ So, given the background color and the resultant color, what was
 composited on to it?
 */
 
+///
 ubyte unalpha(ubyte colorYouHave, float alpha, ubyte backgroundColor) {
 	// resultingColor = (1-alpha) * backgroundColor + alpha * answer
 	auto resultingColorf = cast(float) colorYouHave;
@@ -605,6 +653,7 @@ ubyte unalpha(ubyte colorYouHave, float alpha, ubyte backgroundColor) {
 	return cast(ubyte) answer;
 }
 
+///
 ubyte makeAlpha(ubyte colorYouHave, ubyte backgroundColor/*, ubyte foreground = 0x00*/) {
 	//auto foregroundf = cast(float) foreground;
 	auto foregroundf = 0.00f;
@@ -644,6 +693,7 @@ int fromHex(string s) {
 	return result;
 }
 
+///
 Color colorFromString(string s) {
 	if(s.length == 0)
 		return Color(0,0,0,255);
@@ -721,6 +771,48 @@ interface MemoryImage {
 
 	/// Image height, in pixels
 	int height() const;
+
+	/// Get image pixel. Slow, but returns valid RGBA color (completely transparent for off-image pixels).
+	Color getPixel(int x, int y) const;
+
+  /// Set image pixel.
+	void setPixel(int x, int y, in Color clr);
+
+	/// Load image from file. This will import arsd.png and arsd.jpeg to do the actual work, and cost nothing if you don't use it.
+	static MemoryImage fromImage(T : const(char)[]) (T filename) @trusted {
+		static if (__traits(compiles, {import arsd.jpeg;})) {
+			// yay, we have jpeg loader here, try it!
+			import arsd.jpeg;
+			bool goodJpeg = false;
+			try {
+				int w, h, c;
+				goodJpeg = detect_jpeg_image_from_file(filename, w, h, c);
+				if (goodJpeg && (w < 1 || h < 1)) goodJpeg = false;
+			} catch (Exception) {} // sorry
+			if (goodJpeg) return readJpeg(filename);
+			enum HasJpeg = true;
+		} else {
+			enum HasJpeg = false;
+		}
+		static if (__traits(compiles, {import arsd.png;})) {
+			// yay, we have png loader here, try it!
+			import arsd.png;
+			static if (is(T == string)) {
+				return readPng(filename);
+			} else {
+				// std.stdio sux!
+				return readPng(filename.idup);
+			}
+			enum HasPng = true;
+		} else {
+			enum HasPng = false;
+		}
+		static if (HasJpeg || HasPng) {
+			throw new Exception("cannot load image '"~filename.idup~"' in unknown format");
+		} else {
+			static assert(0, "please provide 'arsd.png', 'arsd.jpeg' or both to load images!");
+		}
+	}
 }
 
 /// An image that consists of indexes into a color palette. Use getAsTrueColorImage() if you don't care about palettes
@@ -740,6 +832,32 @@ class IndexedImage : MemoryImage {
 	/// .
 	override int height() const {
 		return _height;
+	}
+
+	override Color getPixel(int x, int y) const @trusted {
+		if (x >= 0 && y >= 0 && x < _width && y < _height) {
+			uint pos = y*_width+x;
+			if (pos >= data.length) return Color(0, 0, 0, 0);
+			ubyte b = data.ptr[pos];
+			if (b >= palette.length) return Color(0, 0, 0, 0);
+			return palette.ptr[b];
+		} else {
+			return Color(0, 0, 0, 0);
+		}
+	}
+
+	override void setPixel(int x, int y, in Color clr) @trusted {
+		if (x >= 0 && y >= 0 && x < _width && y < _height) {
+			uint pos = y*_width+x;
+			if (pos >= data.length) return;
+			ubyte pidx = findNearestColor(palette, clr);
+			if (palette.length < 255 &&
+				 (palette.ptr[pidx].r != clr.r || palette.ptr[pidx].g != clr.g || palette.ptr[pidx].b != clr.b || palette.ptr[pidx].a != clr.a)) {
+				// add new color
+				pidx = addColor(clr);
+			}
+			data.ptr[pos] = pidx;
+		}
 	}
 
 	private int _width;
@@ -839,6 +957,22 @@ class TrueColorImage : MemoryImage {
 	override int width() const { return _width; }
 	///.
 	override int height() const { return _height; }
+
+	override Color getPixel(int x, int y) const @trusted {
+		if (x >= 0 && y >= 0 && x < _width && y < _height) {
+			uint pos = y*_width+x;
+			return imageData.colors.ptr[pos];
+		} else {
+			return Color(0, 0, 0, 0);
+		}
+	}
+
+	override void setPixel(int x, int y, in Color clr) @trusted {
+		if (x >= 0 && y >= 0 && x < _width && y < _height) {
+			uint pos = y*_width+x;
+			if (pos+3 < imageData.bytes.length/4) imageData.colors.ptr[pos] = clr;
+		}
+	}
 
 	/// .
 	this(int w, int h) {
@@ -1037,7 +1171,7 @@ img = imageFromPng(readPng(range.range)).getAsTrueColorImage;
 
 	auto qimg = quantize(img, null, 2);
 
-	import simpledisplay;
+	import arsd.simpledisplay;
 	auto win = new SimpleWindow(img.width, img.height * 3);
 	auto painter = win.draw();
 	painter.drawImage(Point(0, 0), Image.fromMemoryImage(img));
@@ -1118,12 +1252,22 @@ void floydSteinbergDither(IndexedImage img, in TrueColorImage original) {
 
 // these are just really useful in a lot of places where the color/image functions are used,
 // so I want them available with Color
+///
 struct Point {
-	int x;
-	int y;
+	int x; ///
+	int y; ///
 }
 
+///
 struct Size {
-	int width;
-	int height;
+	int width; ///
+	int height; ///
+}
+
+///
+struct Rectangle {
+	int left; ///
+	int top; ///
+	int right; ///
+	int bottom; ///
 }

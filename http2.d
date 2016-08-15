@@ -1,5 +1,9 @@
+/// HTTP client lib
 // Copyright 2013, Adam D. Ruppe.
 module arsd.http2;
+
+// FIXME: multipart encoded file uploads needs implementation
+// future: do web client api stuff
 
 debug import std.stdio;
 
@@ -76,25 +80,26 @@ string post(string url, string[string] args, string[string] cookies = null) {
 }
 +/
 
+///
 struct HttpResponse {
-	int code;
-	string codeText;
+	int code; ///
+	string codeText; ///
 
-	string httpVersion;
+	string httpVersion; ///
 
-	string statusLine;
+	string statusLine; ///
 
-	string contentType;
+	string contentType; ///
 
-	string[string] cookies;
+	string[string] cookies; ///
 
-	string[] headers;
-	string[string] headersHash;
+	string[] headers; ///
+	string[string] headersHash; ///
 
-	ubyte[] content;
-	string contentText;
+	ubyte[] content; ///
+	string contentText; ///
 
-	HttpRequestParameters requestParameters;
+	HttpRequestParameters requestParameters; ///
 }
 
 import std.string;
@@ -105,6 +110,7 @@ import std.range;
 
 
 // Copy pasta from cgi.d, then stripped down
+///
 struct Uri {
 	alias toString this; // blargh idk a url really is a string, but should it be implicit?
 
@@ -231,12 +237,13 @@ void main(string args[]) {
 }
 */
 
+///
 struct BasicAuth {
-	string username;
-	string password;
+	string username; ///
+	string password; ///
 }
 
-/*
+/**
 	When you send something, it creates a request
 	and sends it asynchronously. The request object
 
@@ -267,7 +274,6 @@ struct BasicAuth {
 	request.waitForCompletion();
 
 */
-
 class HttpRequest {
 	private static {
 		// we manage the actual connections. When a request is made on a particular
@@ -294,16 +300,21 @@ class HttpRequest {
 			}
 		}
 
-		Socket getOpenSocketOnHost(string host, ushort port) {
+		Socket getOpenSocketOnHost(string host, ushort port, bool ssl) {
 			Socket openNewConnection() {
-				auto socket = new Socket(AddressFamily.INET, SocketType.STREAM);
+				Socket socket;
+				if(ssl)
+					socket = new SslClientSocket(AddressFamily.INET, SocketType.STREAM);
+				else
+					socket = new Socket(AddressFamily.INET, SocketType.STREAM);
+
 				socket.connect(new InternetAddress(host, port));
-				debug writeln("opening to ", host, ":", port);
+				debug(arsd_http2) writeln("opening to ", host, ":", port);
 				return socket;
 			}
 
 			import std.string;
-			auto key = format("%s:%s", host, port);
+			auto key = format("http%s://%s:%s", ssl ? "s" : "", host, port);
 
 			if(auto hostListing = key in socketsPerHost) {
 				// try to find an available socket that is already open
@@ -373,7 +384,7 @@ class HttpRequest {
 					continue;
 				}
 
-				auto socket = getOpenSocketOnHost(pc.requestParameters.host, pc.requestParameters.port);
+				auto socket = getOpenSocketOnHost(pc.requestParameters.host, pc.requestParameters.port, pc.requestParameters.ssl);
 
 				if(socket !is null) {
 					activeRequestOnSocket[socket] = pc;
@@ -411,12 +422,14 @@ class HttpRequest {
 				int inactiveCount = 0;
 				foreach(sock, request; activeRequestOnSocket) {
 					if(readSet.isSet(sock)) {
+						keep_going:
 						auto got = sock.receive(buffer);
+						debug(arsd_http2) writeln("====PACKET ",got,"=====",cast(string)buffer[0 .. got],"===/PACKET===");
 						if(got < 0) {
 							throw new Exception("receive error");
 						} else if(got == 0) {
 							// remote side disconnected
-							debug writeln("remote disconnect");
+							debug(arsd_http2) writeln("remote disconnect");
 							request.state = State.aborted;
 							inactive[inactiveCount++] = sock;
 							loseSocket(request.requestParameters.host, request.requestParameters.port, sock);
@@ -432,6 +445,14 @@ class HttpRequest {
 
 						if(request.onDataReceived)
 							request.onDataReceived(request);
+
+						if(auto s = cast(SslClientSocket) sock) {
+							// select doesn't handle the case with stuff
+							// left in the ssl buffer so i'm checking it separately
+							if(s.dataPending()) {
+								goto keep_going;
+							}
+						}
 					}
 
 					if(request.state == State.sendingHeaders || request.state == State.sendingBody)
@@ -446,7 +467,7 @@ class HttpRequest {
 				}
 
 				foreach(s; inactive[0 .. inactiveCount]) {
-					debug writeln("removing socket from active list");
+					debug(arsd_http2) writeln("removing socket from active list");
 					activeRequestOnSocket.remove(s);
 				}
 			}
@@ -477,7 +498,11 @@ class HttpRequest {
 
 	bool closeSocketWhenComplete;
 
+	import std.zlib;
+	UnCompress uncompress;
+
 	void handleIncomingData(scope const ubyte[] dataIn) {
+	debug(arsd_http2) writeln("handleIncomingData, state: ", state);
 		if(state == State.waitingForResponse) {
 			state = State.readingHeaders;
 			headerReadingState = HeaderReadingState.init;
@@ -517,30 +542,38 @@ class HttpRequest {
 
 					switch(name) {
 						case "Connection":
+						case "connection":
 							if(value == "close")
 								closeSocketWhenComplete = true;
 						break;
 						case "Content-Type":
+						case "content-type":
 							responseData.contentType = value;
 						break;
 						case "Content-Length":
+						case "content-length":
 							bodyReadingState.contentLengthRemaining = to!int(value);
 						break;
 						case "Transfer-Encoding":
+						case "transfer-encoding":
 							// note that if it is gzipped, it zips first, then chunks the compressed stream.
 							// so we should always dechunk first, then feed into the decompressor
-							if(value == "chunked")
+							if(value.strip == "chunked")
 								bodyReadingState.isChunked = true;
 							else throw new Exception("Unknown Transfer-Encoding: " ~ value);
 						break;
 						case "Content-Encoding":
-							if(value == "gzip")
+						case "content-encoding":
+							if(value == "gzip") {
 								bodyReadingState.isGzipped = true;
-							else if(value == "deflate")
+								uncompress = new UnCompress();
+							} else if(value == "deflate") {
 								bodyReadingState.isDeflated = true;
-							else throw new Exception("Unknown Content-Encoding: " ~ value);
+								uncompress = new UnCompress();
+							} else throw new Exception("Unknown Content-Encoding: " ~ value);
 						break;
 						case "Set-Cookie":
+						case "set-cookie":
 							// FIXME handle
 						break;
 						default:
@@ -617,6 +650,7 @@ class HttpRequest {
 							} else {
 								int power = 1;
 								bodyReadingState.contentLengthRemaining = 0;
+								assert(a != 0, cast(string) data);
 								for(int b = a-1; b >= 0; b--) {
 									char cc = data[b];
 									if(cc >= 'a' && cc <= 'z')
@@ -627,9 +661,11 @@ class HttpRequest {
 									else
 										val = cc - 'A' + 10;
 
+									assert(val >= 0 && val <= 15, to!string(val));
 									bodyReadingState.contentLengthRemaining += power * val;
 									power *= 16;
 								}
+								debug(arsd_http2) writeln("Chunk length: ", bodyReadingState.contentLengthRemaining);
 								bodyReadingState.chunkedState++;
 								continue;
 							}
@@ -638,38 +674,80 @@ class HttpRequest {
 							char c = data[a];
 							if(c == '\n') {
 								if(bodyReadingState.contentLengthRemaining == 0)
-									bodyReadingState.chunkedState = 3;
+									bodyReadingState.chunkedState = 5;
 								else
 									bodyReadingState.chunkedState = 2;
 							}
 						break;
 						case 2: // reading data
-							// FIXME: gunzip
-							responseData.content ~= data[a .. a + bodyReadingState.contentLengthRemaining];
+							auto can = a + bodyReadingState.contentLengthRemaining;
+							if(can > data.length)
+								can = cast(int) data.length;
 
-							a += bodyReadingState.contentLengthRemaining;
-							a += 1; // skipping a 13 10
-							data = data[a+1 .. $];
+							//if(bodyReadingState.isGzipped || bodyReadingState.isDeflated)
+							//	responseData.content ~= cast(ubyte[]) uncompress.uncompress(data[a .. can]);
+							//else
+								responseData.content ~= data[a .. can];
+
+							bodyReadingState.contentLengthRemaining -= can - a;
+							debug(arsd_http2) writeln("clr: ", bodyReadingState.contentLengthRemaining, " " , a, " ", can);
+							a += can - a;
+							assert(bodyReadingState.contentLengthRemaining >= 0);
+							if(bodyReadingState.contentLengthRemaining == 0) {
+								bodyReadingState.chunkedState++;
+								data = data[a .. $];
+							} else {
+								data = data[a .. $];
+							}
+							goto start_over;
+						case 3: // reading 13/10
+							assert(data[a] == 13);
+							bodyReadingState.chunkedState++;
+						break;
+						case 4: // reading 10 at end of packet
+							assert(data[a] == 10);
+							data = data[a + 1 .. $];
 							bodyReadingState.chunkedState = 0;
 							goto start_over;
-						case 3: // reading footers
-							goto done; // FIXME
+						case 5: // reading footers
+							//goto done; // FIXME
+							state = State.complete;
+
+							// skip the tailing chunk of headers
+							// FIXME
+							if(data.length == 5 && data == [48, 13, 10, 13, 10])
+								a = cast(int) data.length;
+
+							if(bodyReadingState.isGzipped || bodyReadingState.isDeflated) {
+								auto n = uncompress.uncompress(responseData.content);
+								n ~= uncompress.flush();
+								responseData.content = cast(ubyte[]) n;
+							}
+
+							//	responseData.content ~= cast(ubyte[]) uncompress.flush();
+
+							responseData.contentText = cast(string) responseData.content;
 					}
 				}
 
 				done:
-				state = State.complete;
-
-				responseData.contentText = cast(string) responseData.content;
 				// FIXME
 				//if(closeSocketWhenComplete)
 					//socket.close();
 			} else {
-				// FIXME: gunzip
-				responseData.content ~= data;
-				assert(data.length <= bodyReadingState.contentLengthRemaining);
+				//if(bodyReadingState.isGzipped || bodyReadingState.isDeflated)
+				//	responseData.content ~= cast(ubyte[]) uncompress.uncompress(data);
+				//else
+					responseData.content ~= data;
+				assert(data.length <= bodyReadingState.contentLengthRemaining, format("%d <= %d\n%s", data.length, bodyReadingState.contentLengthRemaining, cast(string)data));
 				bodyReadingState.contentLengthRemaining -= data.length;
 				if(bodyReadingState.contentLengthRemaining == 0) {
+					if(bodyReadingState.isGzipped || bodyReadingState.isDeflated) {
+						auto n = uncompress.uncompress(responseData.content);
+						n ~= uncompress.flush();
+						responseData.content = cast(ubyte[]) n;
+						//responseData.content ~= cast(ubyte[]) uncompress.flush();
+					}
 					state = State.complete;
 					responseData.contentText = cast(string) responseData.content;
 					// FIXME
@@ -683,14 +761,20 @@ class HttpRequest {
 	this() {
 	}
 
+	///
 	this(Uri where, HttpVerb method) {
 		auto parts = where;
 		requestParameters.method = method;
 		requestParameters.host = parts.host;
 		requestParameters.port = cast(ushort) parts.port;
+		requestParameters.ssl = parts.scheme == "https";
 		if(parts.port == 0)
-			requestParameters.port = 80; // FIXME: SSL
-		requestParameters.uri = parts.path;
+			requestParameters.port = requestParameters.ssl ? 443 : 80;
+		requestParameters.uri = parts.path.length ? parts.path : "/";
+		if(parts.query.length) {
+			requestParameters.uri ~= "?";
+			requestParameters.uri ~= parts.query;
+		}
 	}
 
 	~this() {
@@ -705,7 +789,12 @@ class HttpRequest {
 	size_t bodyBytesSent;
 	size_t bodyBytesReceived;
 
-	State state;
+	State state_;
+	State state() { return state_; }
+	State state(State s) {
+		assert(state_ != State.complete);
+		return state_ = s;
+	}
 	/// Called when data is received. Check the state to see what data is available.
 	void delegate(HttpRequest) onDataReceived;
 
@@ -751,7 +840,11 @@ class HttpRequest {
 			return; // already sent
 		string headers;
 
-		headers ~= to!string(requestParameters.method) ~ " "~requestParameters.uri~" HTTP/1.1\r\n";
+		headers ~= to!string(requestParameters.method) ~ " "~requestParameters.uri;
+		if(requestParameters.useHttp11)
+			headers ~= " HTTP/1.1\r\n";
+		else
+			headers ~= " HTTP/1.0\r\n";
 		headers ~= "Host: "~requestParameters.host~"\r\n";
 		if(requestParameters.userAgent.length)
 			headers ~= "User-Agent: "~requestParameters.userAgent~"\r\n";
@@ -759,6 +852,8 @@ class HttpRequest {
 			headers ~= "Authorization: "~requestParameters.authorization~"\r\n";
 		if(requestParameters.bodyData.length)
 			headers ~= "Content-Length: "~to!string(requestParameters.bodyData.length)~"\r\n";
+		if(requestParameters.acceptGzip)
+			headers ~= "Accept-Encoding: gzip\r\n";
 
 		foreach(header; requestParameters.headers)
 			headers ~= header ~ "\r\n";
@@ -796,40 +891,65 @@ class HttpRequest {
 		// FIXME
 	}
 
-	HttpRequestParameters requestParameters;
+	HttpRequestParameters requestParameters; ///
 }
 
+///
 struct HttpRequestParameters {
 	// Duration timeout;
 
 	// debugging
-	bool useHttp11 = true;
-	bool acceptGzip = true;
+	bool useHttp11 = true; ///
+	bool acceptGzip = true; ///
 
 	// the request itself
-	HttpVerb method;
-	string host;
-	ushort port;
-	string uri;
+	HttpVerb method; ///
+	string host; ///
+	ushort port; ///
+	string uri; ///
 
-	string userAgent;
-	string authorization;
+	bool ssl; ///
 
-	string[string] cookies;
+	string userAgent; ///
+	string authorization; ///
+
+	string[string] cookies; ///
 
 	string[] headers; /// do not duplicate host, content-length, content-type, or any others that have a specific property
 
-	string contentType;
-	ubyte[] bodyData;
+	string contentType; ///
+	ubyte[] bodyData; ///
 }
 
 interface IHttpClient {
 
 }
 
-enum HttpVerb { GET, HEAD, POST, PUT, DELETE, OPTIONS, TRACE, CONNECT, PATCH, MERGE }
+///
+enum HttpVerb {
+	///
+	GET,
+	///
+	HEAD,
+	///
+	POST,
+	///
+	PUT,
+	///
+	DELETE,
+	///
+	OPTIONS,
+	///
+	TRACE,
+	///
+	CONNECT,
+	///
+	PATCH,
+	///
+	MERGE
+}
 
-/*
+/**
 	Usage:
 
 	auto client = new HttpClient("localhost", 80);
@@ -844,12 +964,13 @@ enum HttpVerb { GET, HEAD, POST, PUT, DELETE, OPTIONS, TRACE, CONNECT, PATCH, ME
 /// HttpClient keeps cookies, location, and some other state to reuse connections, when possible, like a web browser.
 class HttpClient {
 	/* Protocol restrictions, useful to disable when debugging servers */
-	bool useHttp11 = true;
-	bool useGzip = true;
+	bool useHttp11 = true; ///
+	bool acceptGzip = true; ///
 
 	/// Automatically follow a redirection?
-	bool followLocation = false;
+	bool followLocation = false; ///
 
+	///
 	@property Uri location() {
 		return currentUrl;
 	}
@@ -866,6 +987,9 @@ class HttpClient {
 		request.requestParameters.userAgent = userAgent;
 		request.requestParameters.authorization = authorization;
 
+		request.requestParameters.useHttp11 = this.useHttp11;
+		request.requestParameters.acceptGzip = this.acceptGzip;
+
 		return request;
 	}
 
@@ -879,6 +1003,7 @@ class HttpClient {
 	// FIXME: add proxy
 	// FIXME: some kind of caching
 
+	///
 	void setCookie(string name, string value, string domain = null) {
 		if(domain == null)
 			domain = currentDomain;
@@ -886,6 +1011,7 @@ class HttpClient {
 		cookies[domain][name] = value;
 	}
 
+	///
 	void clearCookies(string domain = null) {
 		if(domain is null)
 			cookies = null;
@@ -894,8 +1020,8 @@ class HttpClient {
 	}
 
 	// If you set these, they will be pre-filled on all requests made with this client
-	string userAgent = "D arsd.html2";
-	string authorization;
+	string userAgent = "D arsd.html2"; ///
+	string authorization; ///
 
 	/* inter-request state */
 	string[string][string] cookies;
@@ -919,14 +1045,15 @@ class SimpleCache : ICache {
 	}
 }
 
+///
 struct HttpCookie {
-	string name;
-	string value;
-	string domain;
-	string path;
-	//SysTime expirationDate;
-	bool secure;
-	bool httpOnly;
+	string name; ///
+	string value; ///
+	string domain; ///
+	string path; ///
+	//SysTime expirationDate; ///
+	bool secure; ///
+	bool httpOnly; ///
 }
 
 // FIXME: websocket
@@ -935,18 +1062,282 @@ version(testing)
 void main() {
 	import std.stdio;
 	auto client = new HttpClient();
-	auto request = client.navigateTo(Url("http://localhost/chunked.php"));
+	auto request = client.navigateTo(Uri("http://localhost/chunked.php"));
 	request.send();
-	auto request2 = client.navigateTo(Url("http://dlang.org/"));
+	auto request2 = client.navigateTo(Uri("http://dlang.org/"));
 	request2.send();
 
 	{
 	auto response = request2.waitForCompletion();
-	write(cast(string) response.content);
+	//write(cast(string) response.content);
 	}
 
 	auto response = request.waitForCompletion();
 	write(cast(string) response.content);
 
 	writeln(HttpRequest.socketsPerHost);
+}
+
+
+// From sslsocket.d
+
+version=use_openssl;
+
+version(use_openssl) {
+	alias SslClientSocket = OpenSslSocket;
+
+	extern(C) {
+		int SSL_library_init();
+		void OpenSSL_add_all_ciphers();
+		void OpenSSL_add_all_digests();
+		void SSL_load_error_strings();
+
+		struct SSL {}
+		struct SSL_CTX {}
+		struct SSL_METHOD {}
+
+		SSL_CTX* SSL_CTX_new(const SSL_METHOD* method);
+		SSL* SSL_new(SSL_CTX*);
+		int SSL_set_fd(SSL*, int);
+		int SSL_connect(SSL*);
+		int SSL_write(SSL*, const void*, int);
+		int SSL_read(SSL*, void*, int);
+		void SSL_free(SSL*);
+		void SSL_CTX_free(SSL_CTX*);
+
+		int SSL_pending(const SSL*);
+
+		void SSL_set_verify(SSL*, int, void*);
+		enum SSL_VERIFY_NONE = 0;
+
+		SSL_METHOD* SSLv3_client_method();
+		SSL_METHOD* TLS_client_method();
+		SSL_METHOD* SSLv23_client_method();
+
+		void ERR_print_errors_fp(FILE*);
+	}
+
+	import core.stdc.stdio;
+
+	shared static this() {
+		SSL_library_init();
+		OpenSSL_add_all_ciphers();
+		OpenSSL_add_all_digests();
+		SSL_load_error_strings();
+	}
+
+	pragma(lib, "crypto");
+	pragma(lib, "ssl");
+
+	class OpenSslSocket : Socket {
+		private SSL* ssl;
+		private SSL_CTX* ctx;
+		private void initSsl(bool verifyPeer) {
+			ctx = SSL_CTX_new(SSLv23_client_method());
+			assert(ctx !is null);
+
+			ssl = SSL_new(ctx);
+			if(!verifyPeer)
+				SSL_set_verify(ssl, SSL_VERIFY_NONE, null);
+			SSL_set_fd(ssl, this.handle);
+		}
+
+		bool dataPending() {
+			return SSL_pending(ssl) > 0;
+		}
+
+		@trusted
+		override void connect(Address to) {
+			super.connect(to);
+			if(SSL_connect(ssl) == -1) {
+				ERR_print_errors_fp(core.stdc.stdio.stderr);
+				int i;
+				printf("wtf\n");
+				scanf("%d\n", i);
+				throw new Exception("ssl connect");
+			}
+		}
+		
+		@trusted
+		override ptrdiff_t send(const(void)[] buf, SocketFlags flags) {
+			auto retval = SSL_write(ssl, buf.ptr, cast(uint) buf.length);
+			if(retval == -1) {
+				ERR_print_errors_fp(core.stdc.stdio.stderr);
+				int i;
+				printf("wtf\n");
+				scanf("%d\n", i);
+				throw new Exception("ssl send");
+			}
+			return retval;
+
+		}
+		override ptrdiff_t send(const(void)[] buf) {
+			return send(buf, SocketFlags.NONE);
+		}
+		@trusted
+		override ptrdiff_t receive(void[] buf, SocketFlags flags) {
+			auto retval = SSL_read(ssl, buf.ptr, cast(int)buf.length);
+			if(retval == -1) {
+				ERR_print_errors_fp(core.stdc.stdio.stderr);
+				int i;
+				printf("wtf\n");
+				scanf("%d\n", i);
+				throw new Exception("ssl send");
+			}
+			return retval;
+		}
+		override ptrdiff_t receive(void[] buf) {
+			return receive(buf, SocketFlags.NONE);
+		}
+
+		this(AddressFamily af, SocketType type = SocketType.STREAM, bool verifyPeer = true) {
+			super(af, type);
+			initSsl(verifyPeer);
+		}
+
+		this(socket_t sock, AddressFamily af) {
+			super(sock, af);
+			initSsl(true);
+		}
+
+		~this() {
+			SSL_free(ssl);
+			SSL_CTX_free(ctx);
+		}
+	}
+}
+
+class HttpApiClient() {
+	import arsd.jsvar;
+
+	HttpClient httpClient;
+
+	alias HttpApiClientType = typeof(this);
+
+	string urlBase;
+	string oauth2Token;
+	string submittedContentType;
+
+	this(string urlBase, string oauth2Token, string submittedContentType = "application/json") {
+		httpClient = new HttpClient();
+
+		assert(urlBase[0] == 'h');
+		assert(urlBase[$-1] == '/');
+
+		this.urlBase = urlBase;
+		this.oauth2Token = oauth2Token;
+		this.submittedContentType = submittedContentType;
+	}
+
+	static struct HttpRequestWrapper {
+		HttpApiClientType apiClient;
+		HttpRequest request;
+		this(HttpApiClientType apiClient, HttpRequest request) {
+			this.apiClient = apiClient;
+			this.request = request;
+		}
+
+		var result() {
+			return apiClient.throwOnError(request.waitForCompletion());
+		}
+
+		alias request this;
+	}
+
+	HttpRequestWrapper request(string uri, HttpVerb requestMethod = HttpVerb.GET, ubyte[] bodyBytes = null) {
+		if(uri[0] == '/')
+			uri = uri[1 .. $];
+
+		auto u = Uri(uri).basedOn(Uri(urlBase));
+		auto req = httpClient.navigateTo(u, requestMethod);
+
+		if(oauth2Token.length)
+			req.requestParameters.headers ~= "Authorization: Bearer " ~ oauth2Token;
+		req.requestParameters.contentType = submittedContentType;
+		req.requestParameters.bodyData = bodyBytes;
+
+		return HttpRequestWrapper(this, req);
+	}
+
+	var throwOnError(HttpResponse res) {
+		if(res.code < 200 || res.code >= 300)
+			throw new Exception(res.codeText);
+
+		var response = var.fromJson(res.contentText);
+		if(response.errors) {
+			throw new Exception(response.errors.toJson());
+		}
+
+		return response;
+	}
+
+	@property RestBuilder rest() {
+		return RestBuilder(this, null, null);
+	}
+
+	// hipchat.rest.room["Tech Team"].history
+        // gives: "/room/Tech%20Team/history"
+	//
+	// hipchat.rest.room["Tech Team"].history("page", "12)
+	static struct RestBuilder {
+		HttpApiClientType apiClient;
+		string[] pathParts;
+		string[2][] queryParts;
+		this(HttpApiClientType apiClient, string[] pathParts, string[2][] queryParts) {
+			this.apiClient = apiClient;
+			this.pathParts = pathParts;
+			this.queryParts = queryParts;
+		}
+
+		RestBuilder opDispatch(string str)() {
+			return RestBuilder(apiClient, pathParts ~ str, queryParts);
+		}
+
+		RestBuilder opIndex(string str) {
+			return RestBuilder(apiClient, pathParts ~ str, queryParts);
+		}
+		RestBuilder opIndex(int i) {
+			return RestBuilder(apiClient, pathParts ~ to!string(i), queryParts);
+		}
+
+		RestBuilder opCall(T)(string name, T value) {
+			return RestBuilder(apiClient, pathParts, queryParts ~ [name, to!string(value)]);
+		}
+
+		string toUri() {
+			import std.uri;
+			string result;
+			foreach(idx, part; pathParts) {
+				if(idx)
+					result ~= "/";
+				result ~= encodeComponent(part);
+			}
+			result ~= "?";
+			foreach(idx, part; queryParts) {
+				if(idx)
+					result ~= "&";
+				result ~= encodeComponent(part[0]);
+				result ~= "=";
+				result ~= encodeComponent(part[1]);
+			}
+			return result;
+		}
+
+		final HttpRequestWrapper GET() { return _EXECUTE(HttpVerb.GET, this.toUri(), null); }
+		final HttpRequestWrapper DELETE() { return _EXECUTE(HttpVerb.DELETE, this.toUri(), null); }
+
+		// need to be able to send: JSON, urlencoded, multipart/form-data, and raw stuff.
+		final HttpRequestWrapper POST(T...)(T t) { return _EXECUTE(HttpVerb.POST, this.toUri(), toBytes(t)); }
+		final HttpRequestWrapper PATCH(T...)(T t) { return _EXECUTE(HttpVerb.PATCH, this.toUri(), toBytes(t)); }
+		final HttpRequestWrapper PUT(T...)(T t) { return _EXECUTE(HttpVerb.PUT, this.toUri(), toBytes(t)); }
+
+		private ubyte[] toBytes(T...)(T t) {
+			return null; // FIXME
+
+		}
+
+		HttpRequestWrapper _EXECUTE(HttpVerb verb, string uri, ubyte[] bodyBytes) {
+			return apiClient.request(uri, verb, bodyBytes);
+		}
+	}
 }

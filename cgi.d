@@ -16,39 +16,136 @@
 	// that takes a Cgi param, and use mixin GenericMain
 	// for maximum compatibility with different web servers.
 	void hello(Cgi cgi) {
-		cgi.write("Hello, world!");
+		cgi.setResponseContentType("text/plain");
+
+		if("name" in cgi.get)
+			cgi.write("Hello, " ~ cgi.get["name"]);
+		else
+			cgi.write("Hello, world!");
 	}
 
 	mixin GenericMain!hello;
 	---
 
+
+	Compile_and_run:
+	
+	For CGI, `dmd yourfile.d cgi.d` then put the executable in your cgi-bin directory.
+
+	For FastCGI: `dmd yourfile.d cgi.d -version=fastcgi` and run it. spawn-fcgi helps on nginx. You can put the file in the directory for Apache. On IIS, run it with a port on the command line.
+
+	For SCGI: `dmd yourfile.d cgi.d -version=scgi` and run the executable, providing a port number on the command line.
+
+	For an embedded HTTP server, run `dmd yourfile.d cgi.d -version=embedded_httpd` and run the generated program. It listens on port 8085 by default. You can change this on the command line with the --port option when running your program.
+
+	You can also simulate a request by passing parameters on the command line, like:
+
+	$(CONSOLE
+	./yourprogram GET / name=adr
+	)
+
+	And it will print the result to stdout.
+
+	CGI_Setup_tips:
+
+	On Apache, you may do `SetHandler cgi-script` in your `.htaccess` file.
+
+	Integration_tips:
+
+	cgi.d works well with dom.d for generating html. You may also use web.d for other utilities and automatic api wrapping.
+
+	dom.d usage:
+
+	---
+		import arsd.cgi;
+		import arsd.dom;
+
+		void hello_dom(Cgi cgi) {
+			auto document = new Document();
+
+			static import std.file;
+			// parse the file in strict mode, requiring it to be well-formed UTF-8 XHTML
+			// (You'll appreciate this if you've ever had to deal with a missing </div>
+			// or something in a php or erb template before that would randomly mess up
+			// the output in your browser. Just check it and throw an exception early!)
+			//
+			// You could also hard-code a template or load one at compile time with an
+			// import expression, but you might appreciate making it a regular file
+			// because that means it can be more easily edited by the frontend team and
+			// they can see their changes without needing to recompile the program.
+			//
+			// Note on CTFE: if you do choose to load a static file at compile time,
+			// you *can* parse it in CTFE using enum, which will cause it to throw at
+			// compile time, which is kinda cool too. Be careful in modifying that document,
+			// though, as it will be a static instance. You might want to clone on on demand,
+			// or perhaps modify it lazily as you print it out. (Try element.tree, it returns
+			// a range of elements which you could send through std.algorithm functions. But
+			// since my selector implementation doesn't work on that level yet, you'll find that
+			// harder to use. Of course, you could make a static list of matching elements and
+			// then use a simple e is e2 predicate... :) )
+			document.parseUtf8(std.file.read("your_template.html"), true, true);
+
+			// fill in data using DOM functions, so placing it is in the hands of HTML
+			// and it will be properly encoded as text too.
+			//
+			// Plain html templates can't run server side logic, but I think that's a
+			// good thing - it keeps them simple. You may choose to extend the html,
+			// but I think it is best to try to stick to standard elements and fill them
+			// in with requested data with IDs or class names. A further benefit of
+			// this is the designer can also highlight data based on sources in the CSS.
+			//
+			// However, all of dom.d is available, so you can format your data however
+			// you like. You can do partial templates with innerHTML too, or perhaps better,
+			// injecting cloned nodes from a partial document.
+			//
+			// There's a lot of possibilities.
+			document["#name"].innerText = cgi.request("name", "default name");
+
+			// send the document to the browser. The second argument to `cgi.write`
+			// indicates that this is all the data at once, enabling a few small
+			// optimizations.
+			cgi.write(document.toString(), true);
+		}
+	---
+
 	Concepts:
-		Input: get, post, request(), files, cookies, pathInfo, requestMethod, and HTTP headers (headers, userAgent, referrer, accept, authorization, lastEventId
-		Output: cgi.write(), cgi.header(), cgi.setResponseStatus, cgi.setResponseContentType, gzipResponse
-		Cookies: setCookie, clearCookie, cookie, cookies
-		Caching: cgi.setResponseExpires, cgi.updateResponseExpires, cgi.setCache
-		Redirections: cgi.setResponseLocation
-		Other Information: remoteAddress, https, port, scriptName, requestUri, getCurrentCompleteUri, onRequestBodyDataReceived
-		Overriding behavior: handleIncomingDataChunk, prepareForIncomingDataChunks, cleanUpPostDataState
+		Input: [Cgi.get], [Cgi.post], [Cgi.request], [Cgi.files], [Cgi.cookies], [Cgi.pathInfo], [Cgi.requestMethod],
+		       and HTTP headers ([Cgi.headers], [Cgi.userAgent], [Cgi.referrer], [Cgi.accept], [Cgi.authorization], [Cgi.lastEventId]
+
+		Output: [Cgi.write], [Cgi.header], [Cgi.setResponseStatus], [Cgi.setResponseContentType], [Cgi.gzipResponse]
+
+		Cookies: [Cgi.setCookie], [Cgi.clearCookie], [Cgi.cookie], [Cgi.cookies]
+
+		Caching: [Cgi.setResponseExpires], [Cgi.updateResponseExpires], [Cgi.setCache]
+
+		Redirections: [Cgi.setResponseLocation]
+
+		Other Information: [Cgi.remoteAddress], [Cgi.https], [Cgi.port], [Cgi.scriptName], [Cgi.requestUri], [Cgi.getCurrentCompleteUri], [Cgi.onRequestBodyDataReceived]
+
+		Overriding behavior: [Cgi.handleIncomingDataChunk], [Cgi.prepareForIncomingDataChunks], [Cgi.cleanUpPostDataState]
 
 		Installing: Apache, IIS, CGI, FastCGI, SCGI, embedded HTTPD (not recommended for production use)
 
 	Guide_for_PHP_users:
 		If you are coming from PHP, here's a quick guide to help you get started:
 
+		```
 		$_GET["var"] == cgi.get["var"]
 		$_POST["var"] == cgi.post["var"]
 		$_COOKIE["var"] == cgi.cookies["var"]
+		```
 
-		In PHP, you can give a form element a name like "something[]", and then
-		$_POST["something"] gives an array. In D, you can use whatever name
-		you want, and access an array of values with the cgi.getArray["name"] and
-		cgi.postArray["name"] members.
+		In PHP, you can give a form element a name like `"something[]"`, and then
+		`$_POST["something"]` gives an array. In D, you can use whatever name
+		you want, and access an array of values with the `cgi.getArray["name"]` and
+		`cgi.postArray["name"]` members.
 
+		```
 		echo("hello"); == cgi.write("hello");
 
 		$_SERVER["REMOTE_ADDR"] == cgi.remoteAddress
 		$_SERVER["HTTP_HOST"] == cgi.host
+		```
 
 	See_Also:
 
@@ -57,11 +154,19 @@
 	accessing databases.
 
 	If you are looking to access a web application via HTTP, try curl.d.
+
+	Copyright:
+
+	cgi.d copyright 2008-2016, Adam D. Ruppe. Provided under the Boost Software License.
+
+	Yes, this file is almost eight years old, and yes, it is still actively maintained and used.
 +/
 module arsd.cgi;
 
+static import std.file;
+
 version(embedded_httpd) {
-	version(Posix)
+	version(linux)
 		version=embedded_httpd_processes;
 	else
 		version=embedded_httpd_threads;
@@ -188,7 +293,7 @@ private struct stdin {
 		}
 	}
 
-	import std.c.windows.windows;
+	import core.sys.windows.windows;
 static:
 
 	static this() {
@@ -834,6 +939,8 @@ class Cgi {
 	// file stuff I'm sure is inefficient. But, my guess is the real bottleneck is network
 	// input anyway, so I'm not going to get too worked up about it right now.
 	protected void handleIncomingDataChunk(const(ubyte)[] chunk) {
+		if(chunk.length == 0)
+			return;
 		assert(chunk.length <= 32 * 1024 * 1024); // we use chunk size as a memory constraint thing, so
 							// if we're passed big chunks, it might throw unnecessarily.
 							// just pass it smaller chunks at a time.
@@ -1136,6 +1243,9 @@ class Cgi {
 			// simple handling, but it works... until someone bombs us with gigabytes of crap at least...
 			if(pps.buffer.length == pps.expectedLength)
 				pps._post = decodeVariables(cast(string) pps.buffer);
+			else {
+				// just for debugging
+			}
 		}
 	}
 
@@ -1393,8 +1503,9 @@ class Cgi {
 
 		if(contentLength) {
 			prepareForIncomingDataChunks(contentType, contentLength);
-			foreach(dataChunk; dataByChunk)
+			foreach(dataChunk; dataByChunk) {
 				handleIncomingDataChunk(dataChunk);
+			}
 			postArray = assumeUnique(pps._post);
 			filesArray = assumeUnique(pps._files);
 			files = keepLastOf(filesArray);
@@ -2431,8 +2542,15 @@ bool isCgiRequestMethod(string s) {
 /// If you want to use a subclass of Cgi with generic main, use this mixin.
 mixin template CustomCgiMain(CustomCgi, alias fun, long maxContentLength = defaultMaxContentLength) if(is(CustomCgi : Cgi)) {
 	// kinda hacky - the T... is passed to Cgi's constructor in standard cgi mode, and ignored elsewhere
+	mixin CustomCgiMainImpl!(CustomCgi, fun, maxContentLength) customCgiMainImpl_;
 
 	void main(string[] args) {
+		customCgiMainImpl_.cgiMainImpl(args);
+	}
+}
+
+mixin template CustomCgiMainImpl(CustomCgi, alias fun, long maxContentLength = defaultMaxContentLength) if(is(CustomCgi : Cgi)) {
+	void cgiMainImpl(string[] args) {
 
 
 		// we support command line thing for easy testing everywhere
@@ -2570,8 +2688,13 @@ mixin template CustomCgiMain(CustomCgi, alias fun, long maxContentLength = defau
 							} else {
 								if(!ir.empty)
 									ir.popFront(); // get the next
+								else if(ir.sourceClosed) {
+									ir.source.close();
+								}
 							}
 						}
+
+						ir.source.close();
 					}
 				} else {
 					processCount++;
@@ -2762,8 +2885,12 @@ void doThreadHttpConnection(CustomCgi, alias fun)(Socket connection) {
 		} else {
 			if(!ir.empty)
 				ir.popFront(); // get the next
+			else if(ir.sourceClosed)
+				ir.source.close();
 		}
 	}
+
+	ir.source.close();
 }
 
 version(scgi)
@@ -2821,7 +2948,8 @@ void doThreadScgiConnection(CustomCgi, alias fun, long maxContentLength)(Socket 
 		if(data.length == 0 && !range.sourceClosed) {
 			range.popFront(0);
 			data = range.front();
-		}
+		} else if (range.sourceClosed)
+			range.source.close();
 
 		return data;
 	}
@@ -2998,6 +3126,7 @@ import std.socket;
 
 // it is a class primarily for reference semantics
 // I might change this interface
+///
 class BufferedInputRange {
 	version(Posix)
 	this(int source, ubyte[] buffer = null) {
@@ -3034,10 +3163,11 @@ class BufferedInputRange {
 		You can also specify 0, to append to the buffer, or any other number
 		to remove the front n bytes and wait for more.
 	*/
-	void popFront(size_t maxBytesToConsume = 0 /*size_t.max*/, size_t minBytesToSettleFor = 0) {
+	void popFront(size_t maxBytesToConsume = 0 /*size_t.max*/, size_t minBytesToSettleFor = 0, bool skipConsume = false) {
 		if(sourceClosed)
 			throw new Exception("can't get any more data from a closed source");
-		consume(maxBytesToConsume);
+		if(!skipConsume)
+			consume(maxBytesToConsume);
 
 		// we might have to grow the buffer
 		if(minBytesToSettleFor > underlyingBuffer.length || view.length == underlyingBuffer.length) {
@@ -3082,8 +3212,15 @@ class BufferedInputRange {
 	/// consume some.
 	ubyte[] consume(size_t bytes) {
 		view = view[bytes > $ ? $ : bytes .. $];
-		if(view.length == 0)
+		if(view.length == 0) {
 			view = underlyingBuffer[0 .. 0]; // go ahead and reuse the beginning
+			/*
+			writeln("HERE");
+			popFront(0, 0, true); // try to load more if we can, checks if the source is closed
+			writeln(cast(string)front);
+			writeln("DONE");
+			*/
+		}
 		return front;
 	}
 
@@ -3320,7 +3457,7 @@ version(Windows) {
 }
 
 version(Posix) {
-	static import linux = std.c.linux.linux;
+	static import linux = core.sys.posix.unistd;
 }
 
 string getTempDirectory() {
@@ -3507,6 +3644,9 @@ ByChunkRange byChunk(BufferedInputRange ir, size_t atMost) {
 				a = ir.consume(a.length);
 				if(atMost != 0)
 					ir.popFront();
+				if(f.length == 0) {
+					f = ir.front();
+				}
 			} else {
 				// we actually have *more* here than we need....
 				f = a[0..atMost];
@@ -3524,6 +3664,7 @@ version(cgi_with_websocket) {
 		WEBSOCKET SUPPORT:
 
 		Full example:
+		---
 			import arsd.cgi;
 
 			void websocketEcho(Cgi cgi) {
@@ -3551,6 +3692,7 @@ version(cgi_with_websocket) {
 			}
 
 			mixin GenericMain!websocketEcho;
+		---
 	*/
 
 	class WebSocket {
@@ -3651,6 +3793,8 @@ version(cgi_with_websocket) {
 
 		cgi.websocketMode = true;
 		cgi.write("");
+
+		cgi.flush();
 
 		return new WebSocket(cgi);
 	}
@@ -3765,6 +3909,7 @@ version(cgi_with_websocket) {
 			//writeln("SENDING ", headerScratch[0 .. headerScratchPos], data);
 			cgi.write(headerScratch[0 .. headerScratchPos]);
 			cgi.write(data);
+			cgi.flush();
 		}
 
 		static WebSocketMessage read(ubyte[] d) {
@@ -3840,11 +3985,11 @@ version(cgi_with_websocket) {
 }
 
 /*
-Copyright: Adam D. Ruppe, 2008 - 2013
+Copyright: Adam D. Ruppe, 2008 - 2015
 License:   <a href="http://www.boost.org/LICENSE_1_0.txt">Boost License 1.0</a>.
 Authors: Adam D. Ruppe
 
-	Copyright Adam D. Ruppe 2008 - 2013.
+	Copyright Adam D. Ruppe 2008 - 2015.
 Distributed under the Boost Software License, Version 1.0.
    (See accompanying file LICENSE_1_0.txt or copy at
 	http://www.boost.org/LICENSE_1_0.txt)

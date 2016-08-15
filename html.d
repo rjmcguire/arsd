@@ -1,5 +1,5 @@
 /**
-	This module includes functions to work with HTML.
+	This module includes functions to work with HTML and CSS.
 
 	It publically imports the DOM module to get started.
 	Then it adds a number of functions to enhance html
@@ -11,6 +11,7 @@ module arsd.html;
 public import arsd.dom;
 import arsd.color;
 
+static import std.uri;
 import std.array;
 import std.string;
 import std.variant;
@@ -170,8 +171,8 @@ Element sanitizedHtml(/*in*/ Element userContent, string idPrefix = null, HtmlFe
 
 		if(e.tagName == "iframe") {
 			// some additional restrictions for supported browsers
-			e.security = "restricted";
-			e.sandbox = "";
+			e.attrs.security = "restricted";
+			e.attrs.sandbox = "";
 		}
 	}
 	return div;
@@ -478,7 +479,7 @@ void translateValidation(Document document) {
 
 		if(formValidation != "") {
 			auto os = f.getAttribute("onsubmit");
-			f.onsubmit = `var failed = null; var failedMessage = ''; with(this) { ` ~ formValidation ~ '\n' ~ ` if(failed != null) { alert('Please complete all required fields.\n' + failedMessage); failed.focus(); return false; } `~os~` return true; }`;
+			f.attrs.onsubmit = `var failed = null; var failedMessage = ''; with(this) { ` ~ formValidation ~ '\n' ~ ` if(failed != null) { alert('Please complete all required fields.\n' + failedMessage); failed.focus(); return false; } `~os~` return true; }`;
 		}
 	}
 }
@@ -493,7 +494,7 @@ void translateDateInputs(Document document) {
 			assert(name !is null);
 			auto button = document.createElement("button");
 			button.type = "button";
-			button.onclick = "displayDatePicker('"~name~"');";
+			button.attrs.onclick = "displayDatePicker('"~name~"');";
 			button.innerText = "Choose...";
 			e.parentNode.insertChildAfter(button, e);
 
@@ -537,21 +538,21 @@ void translateStriping(Document document) {
 /// tries to make an input to filter a list. it kinda sucks.
 void translateFiltering(Document document) {
 	foreach(e; document.getElementsBySelector("input[filter_what]")) {
-		auto filterWhat = e.filter_what;
+		auto filterWhat = e.attrs.filter_what;
 		if(filterWhat[0] == '#')
 			filterWhat = filterWhat[1..$];
 
 		auto fw = document.getElementById(filterWhat);
 		assert(fw !is null);
 
-		foreach(a; fw.getElementsBySelector(e.filter_by)) {
+		foreach(a; fw.getElementsBySelector(e.attrs.filter_by)) {
 			a.addClass("filterable_content");
 		}
 
 		e.removeAttribute("filter_what");
 		e.removeAttribute("filter_by");
 
-		e.onkeydown = e.onkeyup = `
+		e.attrs.onkeydown = e.attrs.onkeyup = `
 			var value = this.value;
 			var a = document.getElementById("`~filterWhat~`");
 			var children = a.childNodes;
@@ -690,13 +691,13 @@ void translateInputTitles(Element rootElement) {
 			if(e.hasClass("has-placeholder"))
 				continue;
 			e.addClass("has-placeholder");
-			e.onfocus = e.onfocus ~ `
+			e.attrs.onfocus = e.attrs.onfocus ~ `
 				removeClass(this, 'default');
 				if(this.value == this.getAttribute('title'))
 					this.value = '';
 			`;
 
-			e.onblur = e.onblur ~ `
+			e.attrs.onblur = e.attrs.onblur ~ `
 				if(this.value == '') {
 					addClass(this, 'default');
 					this.value = this.getAttribute('title');
@@ -711,18 +712,18 @@ void translateInputTitles(Element rootElement) {
 
 			if(e.tagName == "input") {
 				if(e.value == "") {
-					e.value = e.title;
+					e.attrs.value = e.attrs.title;
 					e.addClass("default");
 				}
 			} else {
 				if(e.innerText.length == 0) {
-					e.innerText = e.title;
+					e.innerText = e.attrs.title;
 					e.addClass("default");
 				}
 			}
 		}
 
-		form.onsubmit = os ~ form.onsubmit;
+		form.attrs.onsubmit = os ~ form.attrs.onsubmit;
 	}
 }
 
@@ -1235,6 +1236,7 @@ string translateJavascriptSourceWithDToStandardScript(string src)() {
 +/
 
 abstract class CssPart {
+	string comment;
 	override string toString() const;
 	CssPart clone() const;
 }
@@ -1245,6 +1247,7 @@ class CssAtRule : CssPart {
 		assert(css.length);
 		assert(css[0] == '@');
 
+		auto cssl = css.length;
 		int braceCount = 0;
 		int startOfInnerSlice = -1;
 
@@ -1260,7 +1263,7 @@ class CssAtRule : CssPart {
 			if(c == '{') {
 				braceCount++;
 				if(startOfInnerSlice == -1)
-					startOfInnerSlice = i;
+					startOfInnerSlice = cast(int) i;
 			}
 			if(c == '}') {
 				braceCount--;
@@ -1277,6 +1280,12 @@ class CssAtRule : CssPart {
 				}
 			}
 		}
+
+		if(cssl == css.length) {
+			throw new Exception("Bad CSS: unclosed @ rule. " ~ to!string(braceCount) ~ " brace(s) uncloced");
+		}
+
+		innerParts = lexCss(inner, false);
 	}
 
 	string content;
@@ -1284,17 +1293,35 @@ class CssAtRule : CssPart {
 	string opener;
 	string inner;
 
+	CssPart[] innerParts;
+
 	override CssAtRule clone() const {
 		auto n = new CssAtRule();
 		n.content = content;
 		n.opener = opener;
 		n.inner = inner;
+		foreach(part; innerParts)
+			n.innerParts ~= part.clone();
 		return n;
 	}
-	override string toString() const { return content; }
-}
+	override string toString() const {
+		string c;
+		if(comment.length)
+			c ~= "/* " ~ comment ~ "*/\n";
+		c ~= opener.strip();
+		if(innerParts.length) {
+			string i;
+			foreach(part; innerParts)
+				i ~= part.toString() ~ "\n";
 
-import std.stdio;
+			c ~= " {\n";
+			foreach(line; i.splitLines)
+				c ~= "\t" ~ line ~ "\n";
+			c ~= "}";
+		}
+		return c;
+	}
+}
 
 class CssRuleSet : CssPart {
 	this() {}
@@ -1326,7 +1353,7 @@ class CssRuleSet : CssPart {
 			f++;
 		css = css[f .. $];
 
-		contents = lexCss(content);
+		contents = lexCss(content, false);
 	}
 
 	string[] selectors;
@@ -1418,6 +1445,10 @@ class CssRuleSet : CssPart {
 	override string toString() const {
 		string ret;
 
+
+		if(comment.length)
+			ret ~= "/* " ~ comment ~ "*/\n";
+
 		bool outputtedSelector = false;
 		foreach(selector; selectors) {
 			if(outputtedSelector)
@@ -1456,6 +1487,21 @@ class CssRule : CssPart {
 	// note: does not include the ending semicolon
 	string content;
 
+	string key() const {
+		auto idx = content.indexOf(":");
+		if(idx == -1)
+			throw new Exception("Bad css, missing colon in " ~ content);
+		return content[0 .. idx].strip.toLower;
+	}
+
+	string value() const {
+		auto idx = content.indexOf(":");
+		if(idx == -1)
+			throw new Exception("Bad css, missing colon in " ~ content);
+
+		return content[idx + 1 .. $].strip;
+	}
+
 	override CssRule clone() const {
 		auto n = new CssRule();
 		n.content = content;
@@ -1463,19 +1509,31 @@ class CssRule : CssPart {
 	}
 
 	override string toString() const {
+		string ret;
 		if(strip(content).length == 0)
-			return "";
-		return content ~ ";";
+			ret = "";
+		else
+			ret = key ~ ": " ~ value ~ ";";
+
+		if(comment.length)
+			ret ~= " /* " ~ comment ~ " */";
+
+		return ret;
 	}
 }
 
-CssPart[] lexCss(string css) {
-	import std.regex;
-	// strips comments
-	css = std.regex.replace(css, regex(r"\/\*[^*]*\*+([^/*][^*]*\*+)*\/", "g"), "");
+// Never call stripComments = false unless you have already stripped them.
+// this thing can't actually handle comments intelligently.
+CssPart[] lexCss(string css, bool stripComments = true) {
+	if(stripComments) {
+		import std.regex;
+		css = std.regex.replace(css, regex(r"\/\*[^*]*\*+([^/*][^*]*\*+)*\/", "g"), "");
+	}
 
 	CssPart[] ret;
 	css = css.stripLeft();
+
+	int cnt;
 
 	while(css.length > 1) {
 		CssPart p;
@@ -1486,7 +1544,7 @@ CssPart[] lexCss(string css) {
 			// non-at rules can be either rules or sets.
 			// The question is: which comes first, the ';' or the '{' ?
 
-			auto endOfStatement = css.indexOf(";");
+			auto endOfStatement = css.indexOfCssSmart(';');
 			if(endOfStatement == -1)
 				endOfStatement = css.indexOf("}");
 			if(endOfStatement == -1)
@@ -1506,6 +1564,46 @@ CssPart[] lexCss(string css) {
 	}
 
 	return ret;
+}
+
+// This needs to skip characters inside parens or quotes, so it
+// doesn't trip up on stuff like data uris when looking for a terminating
+// character.
+ptrdiff_t indexOfCssSmart(string i, char find) {
+	int parenCount;
+	char quote;
+	bool escaping;
+	foreach(idx, ch; i) {
+		if(escaping) {
+			escaping = false;
+			continue;
+		}
+		if(quote != char.init) {
+			if(ch == quote)
+				quote = char.init;
+			continue;
+		}
+		if(ch == '\'' || ch == '"') {
+			quote = ch;
+			continue;
+		}
+
+		if(ch == '(')
+			parenCount++;
+
+		if(parenCount) {
+			if(ch == ')')
+				parenCount--;
+			continue;
+		}
+
+		// at this point, we are not in parenthesis nor are we in
+		// a quote, so we can actually search for the relevant character
+
+		if(ch == find)
+			return idx;
+	}
+	return -1;
 }
 
 string cssToString(in CssPart[] css) {
@@ -1543,7 +1641,7 @@ const(CssPart)[] denestCss(CssPart[] css) {
 				auto newCss = at.opener ~ "{\n";
 
 					// the whitespace manipulations are just a crude indentation thing
-				newCss ~= "\t" ~ (cssToString(denestCss(lexCss(at.inner))).replace("\n", "\n\t").replace("\n\t\n\t", "\n\n\t"));
+				newCss ~= "\t" ~ (cssToString(denestCss(lexCss(at.inner, false))).replace("\n", "\n\t").replace("\n\t\n\t", "\n\n\t"));
 
 				newCss ~= "\n}";
 
@@ -2161,11 +2259,11 @@ Color readCssColor(string cssColor) {
 }
 
 /*
-Copyright: Adam D. Ruppe, 2010 - 2012
+Copyright: Adam D. Ruppe, 2010 - 2015
 License:   <a href="http://www.boost.org/LICENSE_1_0.txt">Boost License 1.0</a>.
 Authors: Adam D. Ruppe, with contributions by Nick Sabalausky and Trass3r
 
-        Copyright Adam D. Ruppe 2010-2012.
+        Copyright Adam D. Ruppe 2010-2015.
 Distributed under the Boost Software License, Version 1.0.
    (See accompanying file LICENSE_1_0.txt or copy at
         http://www.boost.org/LICENSE_1_0.txt)

@@ -1,3 +1,4 @@
+/// magic web wrapper
 module arsd.web;
 
 // it would be nice to be able to add meta info to a returned envelope
@@ -173,6 +174,7 @@ struct IfInputContentType {
 */
 
 import std.exception;
+static import std.uri;
 public import arsd.dom;
 public import arsd.cgi; // you have to import this in the actual usage file or else it won't link; surely a compiler bug
 import arsd.sha;
@@ -337,7 +339,7 @@ string jsCall(alias Func, Args...)(Args args) /*if(is(__traits(parent, Func) : W
 /// Everything should derive from this instead of the old struct namespace used before
 /// Your class must provide a default constructor.
 class ApiProvider : WebDotDBaseType {
-	private ApiProvider builtInFunctions;
+	/*private*/ ApiProvider builtInFunctions;
 
 	Session session; // note: may be null
 
@@ -520,7 +522,7 @@ class ApiProvider : WebDotDBaseType {
 	// these only work for one particular call
 	private void delegate(Document d)[] documentPostProcessors;
 	private void delegate(Element d)[] elementPostProcessors;
-	private void _initializePerCallInternal() {
+	/*private*/ void _initializePerCallInternal() {
 		documentPostProcessors = null;
 		elementPostProcessors = null;
 
@@ -681,7 +683,7 @@ class ApiProvider : WebDotDBaseType {
 	}
 
 	private string _errorMessageForCatchAll;
-	private FileResource _catchallEntry(string path, string funName, string errorMessage) {
+	/*private*/ FileResource _catchallEntry(string path, string funName, string errorMessage) {
 		if(!errorMessage.length) {
 			/*
 			string allFuncs, allObjs;
@@ -844,48 +846,35 @@ template isEnum(alias T) if(is(T)) {
 		enum bool isEnum = false;
 }
 
+template isEnum(alias T) if(!is(T)) {
+	enum bool isEnum = false;
+}
+
 // WTF, shouldn't is(T == xxx) already do this?
 template isEnum(T) if(!is(T)) {
 	enum bool isEnum = false;
 }
 
-template isStruct(alias T) if(is(T)) {
+template isStruct(alias T) {
 	static if (is(T == struct))
 		enum bool isStruct = true;
 	else
 		enum bool isStruct = false;
 }
 
-// WTF
-template isStruct(T) if(!is(T)) {
-	enum bool isStruct = false;
-}
-
-
-template isApiObject(alias T) if(is(T)) {
+template isApiObject(alias T) {
 	static if (is(T : ApiObject))
 		enum bool isApiObject = true;
 	else
 		enum bool isApiObject = false;
 }
 
-// WTF
-template isApiObject(T) if(!is(T)) {
-	enum bool isApiObject = false;
-}
-
-template isApiProvider(alias T) if(is(T)) {
+template isApiProvider(alias T) {
 	static if (is(T : ApiProvider))
 		enum bool isApiProvider = true;
 	else
 		enum bool isApiProvider = false;
 }
-
-// WTF
-template isApiProvider(T) if(!is(T)) {
-	enum bool isApiProvider = false;
-}
-
 
 template Passthrough(T) {
 	T Passthrough;
@@ -1221,7 +1210,7 @@ void run(Provider)(Cgi cgi, Provider instantiation, size_t pathInfoStartingPoint
 		cgi.gzipResponse = true;
 		cgi.setResponseContentType("text/javascript");
 		cgi.setCache(true);
-		cgi.write(makeJavascriptApi(reflection, replace(cast(string) cgi.requestUri, "functions.js", "")), true);
+		cgi.write(makeJavascriptApi(reflection, replace(cast(string) cgi.pathInfo, "functions.js", "")), true);
 		cgi.close();
 		return;
 	}
@@ -1843,12 +1832,12 @@ Form createAutomaticForm(Document document, string action, in Parameter[] parame
 				input.name = param.name;
 				input.innerText = param.value;
 
-				input.rows = "7";
+				input.attrs.rows = "7";
 
 				auto idx = type.indexOf("-");
 				if(idx != -1) {
 					idx++;
-					input.rows = type[idx .. $];
+					input.attrs.rows = type[idx .. $];
 				}
 			} else {
 				input = Element.make("input");
@@ -2958,7 +2947,8 @@ deprecated string getSessionId(Cgi cgi) {
 }
 
 version(Posix) {
-	static import linux = std.c.linux.linux;
+	static import linux = core.sys.linux.unistd;
+	static import sys_stat = core.sys.posix.sys.stat;
 }
 
 /// This is cookie parameters for the Session class. The default initializers provide some simple default
@@ -3444,8 +3434,8 @@ class Session {
 				// easily stolen. Note: if your shared host doesn't have different
 				// users on the operating system for each user, it's still possible
 				// for them to access this file and hijack your session!
-				version(Posix)
-					enforce(linux.chmod(toStringz(getFilePath()), octal!600) == 0, "chmod failed");
+				version(linux)
+					enforce(sys_stat.chmod(toStringz(getFilePath()), octal!600) == 0, "chmod failed");
 				// FIXME: ensure the file's read permissions are locked down
 				// on Windows too.
 			}
@@ -3607,7 +3597,7 @@ struct TemplateFilters {
 
 		switch(word[$ - 1]) {
 			case 's':
-			case 'a', 'e', 'i', 'o', 'u':
+			case 'a', 'i', 'o', 'u':
 				return word ~ "es";
 			case 'f':
 				return word[0 .. $-1] ~ "ves";
@@ -4021,7 +4011,7 @@ void translateQsa(Document document, Cgi cgi, string logicalScriptName = null) {
 		string[][string] vars;
 		foreach(k, v; cgi.getArray)
 			vars[k] = cast(string[]) v;
-		foreach(k, v; decodeVariablesSingle(a.qsa)) {
+		foreach(k, v; decodeVariablesSingle(a.attrs.qsa)) {
 			if(k in cgi.get && cgi.get[k] == v)
 				matches++;
 			possibilities++;
@@ -4389,7 +4379,7 @@ enum string javascriptBaseImpl = q{
 		}
 
 		if(method == "POST") {
-			xmlHttp.setRequestHeader("Content-type","application/x-www-form-urlencoded");
+			xmlHttp.setRequestHeader("Content-Type","application/x-www-form-urlencoded");
 			a = argString;
 			// adding the CSRF stuff, if necessary
 			if(csrfPair.length) {
@@ -4398,7 +4388,7 @@ enum string javascriptBaseImpl = q{
 				a += csrfPair;
 			}
 		} else {
-			xmlHttp.setRequestHeader("Content-type", "text/plain");
+			xmlHttp.setRequestHeader("Content-Type", "text/plain");
 		}
 
 		xmlHttp.setRequestHeader("X-Requested-With", "XMLHttpRequest");

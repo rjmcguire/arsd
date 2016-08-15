@@ -1,11 +1,60 @@
 // http://msdn.microsoft.com/en-us/library/windows/desktop/bb775498%28v=vs.85%29.aspx
 
-/// FOR BEST RESULTS: be sure to link with the appropriate subsystem command
-/// -L/SUBSYSTEM:WINDOWS:5.0
-/// otherwise you'll get a console and other visual bugs.
+/++
+	minigui is a smallish GUI widget library, aiming to be on par with at least
+	HTML4 forms and a few other expected gui components. It uses native controls
+	on Windows and does its own thing on Linux (Mac is not currently supported but
+	may be later, and should use native controls) to keep size down.
+
+	Its #1 goal is to be useful without being large and complicated like GTK and Qt.
+	I love Qt, if you want something full featured, use it! But if you want something
+	you can just drop into a small project and expect the basics to work without outside
+	dependencies, hopefully minigui will work for you.
+
+	The event model is similar to what you use in the browser with Javascript and the
+	layout engine tries to automatically fit things in.
+
+
+	FOR BEST RESULTS: be sure to link with the appropriate subsystem command
+	`-L/SUBSYSTEM:WINDOWS:5.0`, for example, because otherwise you'll get a
+	console and other visual bugs.
+
+	Examples:
++/
 module arsd.minigui;
 
 /*
+
+	The main goals of minigui.d are to:
+		1) Provide basic widgets that just work in a lightweight lib.
+		   I basically want things comparable to a plain HTML form,
+		   plus the easy and obvious things you expect from Windows
+		   apps like a menu.
+		2) Use native things when possible for best functionality with
+		   least library weight.
+		3) Give building blocks to provide easy extension for your
+		   custom widgets, or hooking into additional native widgets
+		   I didn't wrap.
+		4) Provide interfaces for easy interaction between third
+		   party minigui extensions. (event model, perhaps
+		   signals/slots, drop-in ease of use bits.)
+		5) Zero non-system dependencies, including Phobos as much as
+		   I reasonably can. It must only import arsd.color and
+		   my simpledisplay.d. If you need more, it will have to be
+		   an extension module.
+		6) An easy layout system that generally works.
+
+	A stretch goal is to make it easy to make gui forms with code,
+	some kind of resource file (xml?) and even a wysiwyg designer.
+
+	Another stretch goal is to make it easy to hook data into the gui,
+	including from reflection. So like auto-generate a form from a
+	function signature or struct definition, or show a list from an
+	array that automatically updates as the array is changed. Then,
+	your program focuses on the data more than the gui interaction.
+
+
+
 	STILL NEEDED:
 		* combo box. (this is diff than select because you can free-form edit too. more like a lineedit with autoselect)
 		* slider
@@ -114,7 +163,10 @@ class DataView : Widget {
 
 // FIXME: menus should prolly capture the mouse. ugh i kno.
 
-public import simpledisplay;
+public import arsd.simpledisplay;
+
+version(Windows)
+	import core.sys.windows.windows;
 
 // this is a hack to call the original window procedure on native win32 widgets if our event listener thing prevents default.
 private bool lastDefaultPrevented;
@@ -157,8 +209,10 @@ version(Windows) {
 	Single select, multi select, organization, drag+drop
 */
 
-static if(UsingSimpledisplayX11)
-enum windowBackgroundColor = Color(220, 220, 220);
+//static if(UsingSimpledisplayX11)
+version(win32_widgets) {}
+else
+	enum windowBackgroundColor = Color(220, 220, 220);
 
 private const(char)* toStringzInternal(string s) { return (s ~ '\0').ptr; }
 private const(wchar)* toWstringzInternal(in char[] s) {
@@ -177,9 +231,11 @@ class Action {
 		static Action[int] mapping;
 	}
 
-	this(string label, ushort icon = 0) {
+	this(string label, ushort icon = 0, void delegate() triggered = null) {
 		this.label = label;
 		this.iconId = icon;
+		if(triggered !is null)
+			this.triggered ~= triggered;
 		version(win32_widgets) {
 			id = ++lastId;
 			mapping[id] = this;
@@ -452,6 +508,17 @@ version(win32_widgets) {
 				(*te).parentWindow.focusedWidget = lol;
 			}
 
+
+
+			if(iMessage == WM_CTLCOLORBTN || iMessage == WM_CTLCOLORSTATIC) {
+				SetBkMode(cast(HDC) wParam, TRANSPARENT);
+				return cast(typeof(return)) 
+					//GetStockObject(NULL_BRUSH);
+					// this is the window background color...
+					GetSysColorBrush(COLOR_3DFACE);
+			}
+
+
 			auto pos = getChildPositionRelativeToParentOrigin(*te);
 			lastDefaultPrevented = false;
 			// try {import std.stdio; writeln(typeid(*te)); } catch(Exception e) {}
@@ -494,7 +561,7 @@ version(win32_widgets) {
 	}
 }
 
-version(Windows)
+version(win32_widgets)
 extern(Windows) BOOL childHandler(HWND hwnd, LPARAM lparam) {
 	if(hwnd is null || hwnd in Widget.nativeMapping)
 		return true;
@@ -671,6 +738,14 @@ class Widget {
 	void delegate(ScreenPainter painter) paint;
 
 	ScreenPainter draw() {
+		int x = this.x, y = this.y;
+		auto parent = this.parent;
+		while(parent) {
+			x += parent.x;
+			y += parent.y;
+			parent = parent.parent;
+		}
+
 		auto painter = parentWindow.win.draw();
 		painter.originX = x;
 		painter.originY = y;
@@ -680,6 +755,18 @@ class Widget {
 	protected void privatePaint(ScreenPainter painter, int lox, int loy) {
 		painter.originX = lox + x;
 		painter.originY = loy + y;
+
+		static if(UsingSimpledisplayX11) {
+			XRectangle[1] rects;
+			rects[0] = XRectangle(cast(short)(lox + x), cast(short)(loy + y), cast(short) width, cast(short) height);
+			XSetClipRectangles(XDisplayConnection.get, painter.impl.gc, 0, 0, rects.ptr, 1, 0);
+		} else {
+			version(Windows) {
+				auto region = CreateRectRgn(lox + x, loy + y, lox + x + width, loy + y + height);
+				SelectClipRgn(painter.impl.hdc, region);
+				DeleteObject(region);
+			}
+		}
 		if(paint !is null)
 			paint(painter);
 		foreach(child; children)
@@ -779,6 +866,15 @@ class Window : Widget {
 		this.width = win.width;
 		this.height = win.height;
 		this.parentWindow = this;
+
+
+		win.windowResized = (int w, int h) {
+			this.width = w;
+			this.height = h;
+			recomputeChildLayout();
+			redraw();
+		};
+
 		win.setEventHandlers(
 			(MouseEvent e) {
 				dispatchMouseEvent(e);
@@ -862,7 +958,7 @@ class Window : Widget {
 
 				if(recipient !is null) {
 					// import std.stdio; writeln(typeid(recipient));
-					version(Windows) {
+					version(win32_widgets) {
 						if(recipient.hwnd !is null)
 							SetFocus(recipient.hwnd);
 					} else {
@@ -892,7 +988,7 @@ class Window : Widget {
 				auto b = SelectObject(painter.impl.hdc, GetSysColorBrush(COLOR_3DFACE));
 				auto p = SelectObject(painter.impl.hdc, GetStockObject(NULL_PEN));
 				// since the pen is null, to fill the whole space, we need the +1 on both.
-				Rectangle(painter.impl.hdc, 0, 0, this.width + 1, this.height + 1);
+				gdi.Rectangle(painter.impl.hdc, 0, 0, this.width + 1, this.height + 1);
 				SelectObject(painter.impl.hdc, p);
 				SelectObject(painter.impl.hdc, b);
 			};
@@ -900,6 +996,7 @@ class Window : Widget {
 		else
 		this.paint = (ScreenPainter painter) {
 			painter.fillColor = windowBackgroundColor;
+			painter.outlineColor = windowBackgroundColor;
 			painter.drawRectangle(Point(0, 0), this.width, this.height);
 		};
 	}
@@ -931,7 +1028,8 @@ class Window : Widget {
 	Widget mouseLastOver;
 	Widget mouseLastDownOn;
 	override bool dispatchMouseEvent(MouseEvent ev) {
-		auto ele = widgetAtPoint(this, ev.x, ev.y);
+		auto eleR = widgetAtPoint(this, ev.x, ev.y);
+		auto ele = eleR.widget;
 
 		if(mouseCapturedBy !is null) {
 			if(ele !is mouseCapturedBy && !mouseCapturedBy.isAParentOf(ele))
@@ -942,23 +1040,30 @@ class Window : Widget {
 			mouseLastDownOn = ele;
 			auto event = new Event("mousedown", ele);
 			event.button = ev.button;
+			event.state = ev.modifierState;
+			event.clientX = eleR.x;
+			event.clientY = eleR.y;
 			event.dispatch();
 		} else if(ev.type == 2) {
 			auto event = new Event("mouseup", ele);
 			event.button = ev.button;
+			event.clientX = eleR.x;
+			event.clientY = eleR.y;
+			event.state = ev.modifierState;
 			event.dispatch();
 			if(mouseLastDownOn is ele) {
 				event = new Event("click", ele);
-				event.clientX = ev.x;
-				event.clientY = ev.y;
+				event.clientX = eleR.x;
+				event.clientY = eleR.y;
 				event.button = ev.button;
 				event.dispatch();
 			}
 		} else if(ev.type == 0) {
 			// motion
 			Event event = new Event("mousemove", ele);
-			event.clientX = ev.x;
-			event.clientY = ev.y;
+			event.state = ev.modifierState;
+			event.clientX = eleR.x;
+			event.clientY = eleR.y;
 			event.dispatch();
 
 			if(mouseLastOver !is ele) {
@@ -1008,15 +1113,8 @@ class Window : Widget {
 }
 
 class MainWindow : Window {
-	this() {
-		super(500, 500);
-
-		win.windowResized = (int w, int h) {
-			this.width = w;
-			this.height = h;
-			recomputeChildLayout();
-			redraw();
-		};
+	this(string title = null) {
+		super(500, 500, title);
 
 		defaultEventHandlers["mouseover"] = delegate void(Widget _this, Event event) {
 			if(this.statusBar !is null && event.target.statusTip.length)
@@ -1078,16 +1176,17 @@ class MainWindow : Window {
 
 	MenuBar _menu;
 	MenuBar menu() { return _menu; }
-	void menu(MenuBar m) {
+	MenuBar menu(MenuBar m) {
 		if(_menu !is null) {
 			// make sure it is sanely removed
 			// FIXME
 		}
 
+		_menu = m;
+
 		version(win32_widgets) {
 			SetMenu(parentWindow.win.impl.hwnd, m.handle);
 		} else {
-			_menu = m;
 			super.addChild(m, 0);
 
 		//	clientArea.y = menu.height;
@@ -1095,6 +1194,8 @@ class MainWindow : Window {
 
 			recomputeChildLayout();
 		}
+
+		return _menu;
 	}
 	private Widget _clientArea;
 	@property Widget clientArea() { return _clientArea; }
@@ -1108,6 +1209,9 @@ class MainWindow : Window {
 		_statusBar = bar;
 		super.addChild(_statusBar);
 	}
+
+	@property string title() { return parentWindow.win.title; }
+	@property void title(string title) { parentWindow.win.title = title; }
 }
 
 /**
@@ -1237,7 +1341,7 @@ class MenuBar : Widget {
 		this.addChild(item);
 		items ~= item;
 		version(win32_widgets) {
-			AppendMenu(handle, MF_STRING, item.action is null ? 9000 : item.action.id, toStringzInternal(item.label));
+			AppendMenuA(handle, MF_STRING, item.action is null ? 9000 : item.action.id, toStringzInternal(item.label)); // XXX
 		}
 		return item;
 	}
@@ -1249,7 +1353,7 @@ class MenuBar : Widget {
 		items ~= mbItem;
 
 		version(win32_widgets) {
-			AppendMenu(handle, MF_STRING | MF_POPUP, cast(UINT) item.handle, toStringzInternal(item.label));
+			AppendMenuA(handle, MF_STRING | MF_POPUP, cast(UINT) item.handle, toStringzInternal(item.label)); // XXX
 		} else {
 			mbItem.defaultEventHandlers["click"] = (Widget e, Event ev) {
 				item.parentWindow = e.parentWindow;
@@ -1344,8 +1448,10 @@ class StatusBar : Widget {
 				_content = s;
 				SendMessageA(owner.hwnd, SB_SETTEXT, idx, cast(LPARAM) toStringzInternal(s));
 			} else {
-				_content = s;
-				owner.redraw();
+				if(_content != s) {
+					_content = s;
+					owner.redraw();
+				}
 			}
 		}
 	}
@@ -1474,6 +1580,8 @@ class ProgressBar : Widget {
 }
 
 class Fieldset : Widget {
+	// FIXME: on Windows,it doesn't draw the background on the label
+	// on X, it doesn't fix the clipping rectangle for it
 	version(win32_widgets)
 		override int paddingTop() { return Window.lineHeight; }
 	else
@@ -1587,7 +1695,7 @@ class Menu : Widget {
 		addChild(item);
 		items ~= item;
 		version(win32_widgets) {
-			AppendMenu(handle, MF_STRING, item.action is null ? 9000 : item.action.id, toStringzInternal(item.label));
+			AppendMenuA(handle, MF_STRING, item.action is null ? 9000 : item.action.id, toStringzInternal(item.label)); // XXX
 		}
 		return item;
 	}
@@ -1936,7 +2044,8 @@ class TextLabel : Widget {
 		super(parent);
 		parentWindow = parent.parentWindow;
 		paint = (ScreenPainter painter) {
-			painter.drawText(Point(0, 0), this.label);
+			painter.outlineColor = Color.black;
+			painter.drawText(Point(0, 0), this.label, Point(width,height), TextAlignment.Right);
 		};
 	}
 
@@ -2009,6 +2118,10 @@ class LineEdit : Widget {
 }
 
 class TextEdit : Widget {
+
+	// FIXME
+	mixin ExperimentalTextComponent;
+
 	override int minHeight() { return Window.lineHeight; }
 	override int heightStretchiness() { return 3; }
 	override int widthStretchiness() { return 3; }
@@ -2024,20 +2137,46 @@ class TextEdit : Widget {
 	this(Widget parent = null) {
 		super(parent);
 
+		textLayout = new TextLayout(Rectangle(0, 0, width, height));
+
 		this.paint = (ScreenPainter painter) {
 			painter.fillColor = Color.white;
 			painter.drawRectangle(Point(0, 0), width, height);
 
+			textLayout.boundingBox = Rectangle(4, 4, width - 8, height - 8);
+
 			painter.outlineColor = Color.black;
-			painter.drawText(Point(4, 4), content, Point(width - 4, height - 4));
+			// painter.drawText(Point(4, 4), content, Point(width - 4, height - 4));
+
+			textLayout.drawInto(painter);
 		};
+
+		caratTimer = new Timer(500, {
+			if(!parentWindow.win.closed && parentWindow.focusedWidget is this) {
+				auto painter = this.draw();
+				painter.pen = Pen(Color.white, 1);
+				painter.rasterOp = RasterOp.xor;
+				if(lastClick.element) {
+					painter.drawLine(
+						Point(lastClick.element.xOfIndex(lastClick.offset + 1), lastClick.element.boundingBox.top),
+						Point(lastClick.element.xOfIndex(lastClick.offset + 1), lastClick.element.boundingBox.bottom)
+					);
+				} else {
+					painter.drawLine(
+						Point(4, 4),
+						Point(4, 10)
+					);
+				}
+			}
+		});
 
 		defaultEventHandlers["click"] = delegate (Widget _this, Event ev) {
 			this.focus();
+			lastClick = textLayout.identify(ev.clientX, ev.clientY);
 		};
 
 		defaultEventHandlers["char"] = delegate (Widget _this, Event ev) {
-			content = content() ~ cast(char) ev.character;
+			textLayout.addText("" ~ cast(char) ev.character); // FIXME
 			redraw();
 		};
 
@@ -2046,7 +2185,6 @@ class TextEdit : Widget {
 		//super();
 	}
 
-	string _content;
 	@property string content() {
 		version(win32_widgets) {
 			char[4096] buffer;
@@ -2054,21 +2192,34 @@ class TextEdit : Widget {
 			// FIXME: GetWindowTextLength
 			auto l = GetWindowTextA(hwnd, buffer.ptr, buffer.length - 1);
 			if(l >= 0)
-				_content = buffer[0 .. l].idup;
+				return buffer[0 .. l].idup;
+			else
+				return null;
+		} else {
+			return textLayout.getPlainText();
 		}
-		return _content;
 	}
 	@property void content(string s) {
-		_content = s;
 		version(win32_widgets)
 			SetWindowTextA(hwnd, toStringzInternal(s));
-		else
+		else {
+			textLayout.clear();
+			textLayout.addText(s);
 			redraw();
+		}
 	}
 
 	void focus() {
 		assert(parentWindow !is null);
 		parentWindow.focusedWidget = this;
+	}
+
+	version(win32_widgets) {
+
+	} else {
+		Timer caratTimer;
+		TextLayout textLayout;
+		TextIdentifyResult lastClick;
 	}
 }
 
@@ -2212,6 +2363,8 @@ class Event {
 	Key key;
 	dchar character;
 
+	int state;
+
 	bool shiftKey;
 
 	private bool isBubbling;
@@ -2298,18 +2451,24 @@ bool isAParentOf(Widget a, Widget b) {
 	return false;
 }
 
-Widget widgetAtPoint(Widget starting, int x, int y) {
+struct WidgetAtPointResponse {
+	Widget widget;
+	int x;
+	int y;
+}
+
+WidgetAtPointResponse widgetAtPoint(Widget starting, int x, int y) {
 	assert(starting !is null);
 	auto child = starting.getChildAtPosition(x, y);
 	while(child) {
 		starting = child;
 		x -= child.x;
 		y -= child.y;
-		child = starting.widgetAtPoint(x, y);//starting.getChildAtPosition(x, y);
+		child = starting.widgetAtPoint(x, y).widget;//starting.getChildAtPosition(x, y);
 		if(child is starting)
 			break;
 	}
-	return starting;
+	return WidgetAtPointResponse(starting, x, y);
 }
 
 version(win32_theming) {
@@ -2347,7 +2506,8 @@ extern(Windows):
 }
 
 version(win32_widgets) {
-	import std.c.windows.windows;
+	import core.sys.windows.windows;
+	import gdi = core.sys.windows.wingdi;
 	// import win32.commctrl;
 	// import win32.winuser;
 
@@ -2372,8 +2532,6 @@ extern(Windows):
 	HMENU CreateMenu();
 	bool SetMenu(HWND, HMENU);
 	HMENU CreatePopupMenu();
-	BOOL AppendMenuA(HMENU, uint, UINT_PTR, LPCTSTR);
-	alias AppendMenuA AppendMenu;
 	enum MF_POPUP = 0x10;
 	enum MF_STRING = 0;
 

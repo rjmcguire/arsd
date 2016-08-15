@@ -1,4 +1,7 @@
+/// crappy event loop for linux
 module arsd.eventloop;
+
+version(linux):
 
 /* **** */
 // Loop implementation
@@ -251,6 +254,7 @@ public struct FileEventDispatcher {
 			return;
 
 		addListener(&lowLevelReadHandler);
+		addListener(&lowLevelHupHandler);
 		addListener(&lowLevelWriteHandler);
 		addListener(&lowLevelErrorHandler);
 		handlersActive = true;
@@ -261,6 +265,7 @@ public struct FileEventDispatcher {
 			return;
 
 		removeListener(&lowLevelErrorHandler);
+		removeListener(&lowLevelHupHandler);
 		removeListener(&lowLevelWriteHandler);
 		removeListener(&lowLevelReadHandler);
 		handlersActive = false;
@@ -302,6 +307,9 @@ public struct FileEventDispatcher {
 	private void lowLevelErrorHandler(FileError ev) {
 		doHandler(ev.fd, 2);
 	}
+	private void lowLevelHupHandler(FileHup ev) {
+		doHandler(ev.fd, 2);
+	}
 
 	/// You can add a file to listen to here. Files can be OS handles or Phobos types. The handlers can be null, meaning use the default
 	/// (see: setDefaultHandler), or callables with zero or one argument. If they take an argument, it will be the file being handled at this time.
@@ -330,11 +338,11 @@ public struct FileEventDispatcher {
 			events |= FileEvents.read;
 		}
 		if(writeEventHandler !is null) {
-			handlerSet[0] = wrap(writeEventHandler);
+			handlerSet[1] = wrap(writeEventHandler);
 			events |= FileEvents.write;
 		}
 		if(errorEventHandler !is null)
-			handlerSet[0] = wrap(errorEventHandler);
+			handlerSet[2] = wrap(errorEventHandler);
 
 		listeners[handle] = handlerSet;
 
@@ -344,6 +352,7 @@ public struct FileEventDispatcher {
 
 	public void removeFile(OsFileHandle handle) {
 		listeners.remove(handle);
+		removeFileFromLoopImplementation(handle);
 	}
 
 	/// What should this default handler work on?
@@ -373,7 +382,7 @@ private FileEventDispatcher fileEventDispatcher;
 /// when the state changes. Failure to read it all will leave whatever is left
 /// in the buffer sitting there unnoticed until even more stuff comes in.
 public void addFileEventListeners(T...)(T t) {// if(__traits(compiles, fileEventDispatcher.addFile(t))) {
-	fileEventDispatcher.addFile!(T)(t);
+	fileEventDispatcher.addFile(t);
 }
 
 /// Removes the file from event handling
@@ -450,7 +459,9 @@ version(linux) {
 	int epoll = -1;
 
 	private void addFileToLoopImplementation(int fd, int events, bool edgeTriggered = true) {
-		epoll_event ev;
+		epoll_event ev = void;
+
+		ev.events = 0;
 
 		// I don't remember why I made it edge triggered in the first
 		// place as that requires a bit more care to do correctly and I don't
@@ -462,7 +473,7 @@ version(linux) {
 		// cause an infinite loop. So when an event comes, you MUST starve
 		// the read to get all your info in a timely fashion. Gonna document this.
 		if(edgeTriggered)
-			ev.events = EPOLL_EVENTS.EPOLLET; // edge triggered
+			ev.events = EPOLLET; // edge triggered
 
 		// Oh I think I know why I did this: if it is level triggered
 		// and the data is not actually handled, it infinite loops
@@ -483,11 +494,17 @@ version(linux) {
 		// best of it. Also watch your CPU usage for infinite loops!
 
 		if(events & FileEvents.read)
-			ev.events |= EPOLL_EVENTS.EPOLLIN;
+			ev.events |= EPOLLIN;
 		if(events & FileEvents.write)
-			ev.events |= EPOLL_EVENTS.EPOLLOUT;
+			ev.events |= EPOLLOUT;
 		ev.data.fd = fd;
 		epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &ev);
+	}
+
+	private void removeFileFromLoopImplementation(int fd) {
+		epoll_event ev = void;
+		ev.data.fd = fd;
+		epoll_ctl(epoll, EPOLL_CTL_DEL, fd, &ev);
 	}
 
 
@@ -509,7 +526,7 @@ version(linux) {
 
 		addFileToLoop(pipes[0], FileEvents.read, false);
 
-		epoll_event[16] events;
+		epoll_event[16] events = void;
 
 		timeval tv;
 
@@ -550,18 +567,21 @@ version(linux) {
 				} else {
 					auto flags = events[n].events;
 					import core.stdc.stdio;
-					if(flags & EPOLL_EVENTS.EPOLLIN) {
+					if(flags & EPOLLIN) {
 						sendSync(FileReadyToRead(fd));
 					}
-					if(flags & EPOLL_EVENTS.EPOLLOUT) {
+					if(flags & EPOLLOUT) {
 						sendSync(FileReadyToWrite(fd));
 					}
-					if((flags & EPOLL_EVENTS.EPOLLERR)) {
+					if((flags & EPOLLERR)) {
 						//import core.stdc.stdio; printf("ERROR on fd from epoll %d\n", fd);
 						sendSync(FileError(fd));
-						break outer_loop;
+
+						// I automatically remove them because otherwise the error flag
+						// may never actually be cleared and this thing will infinite loop.
+						removeFileEventListeners(fd);
 					}
-					if((flags & EPOLL_EVENTS.EPOLLHUP)) {
+					if((flags & EPOLLHUP)) {
 						//import core.stdc.stdio; printf("HUP on fd from epoll %d\n", fd);
 						sendSync(FileHup(fd));
 					}
@@ -770,56 +790,7 @@ struct FileHup {
 // epoll
 
 version(linux) {
-	extern(C):
-
-	alias int c_int;
-
-	alias uint uint32_t;
-	alias ulong uint64_t;
-
-	union epoll_data {
-		void    *ptr;
-		int      fd;
-		uint32_t u32;
-		uint64_t u64;
-	}
-
-	struct epoll_event {
-		uint32_t   events;    /* Epoll events */
-		epoll_data data;      /* User data variable */
-	}
-
-	enum EPOLL_CTL_ADD = 1;
-	enum EPOLL_CTL_DEL = 2;
-	enum EPOLL_CTL_MOD = 3;
-
-
-	import std.conv : octal;
-	enum {
-		EPOLL_CLOEXEC = octal!"2000000",
-		EPOLL_NONBLOCK = octal!"4000"
-	}
-
-	enum EPOLL_EVENTS {
-		EPOLLIN = 0x001,
-		EPOLLPRI = 0x002,
-		EPOLLOUT = 0x004,
-		EPOLLRDNORM = 0x040,
-		EPOLLRDBAND = 0x080,
-		EPOLLWRNORM = 0x100,
-		EPOLLWRBAND = 0x200,
-		EPOLLMSG = 0x400,
-		EPOLLERR = 0x008,
-		EPOLLHUP = 0x010,
-		EPOLLRDHUP = 0x2000,
-		EPOLLONESHOT = (1 << 30),
-		EPOLLET = (1 << 31)
-	}
-
-	int epoll_create1(int flags);
-	int epoll_ctl(int epfd, int op, int fd, epoll_event* event);
-	int epoll_wait(int epfd, epoll_event* events, int maxevents, int timeout);
-
+	import core.sys.linux.epoll;
 	import core.sys.posix.sys.time;
 }
 
