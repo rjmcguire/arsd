@@ -2114,6 +2114,63 @@ import core.stdc.config;
 
 version(linux) version=ALSA;
 version(Windows) version=WinMM;
+version(OSX) version=MacAudio;
+
+version(MacAudio) {
+    import core.sys.darwin.mach.port;
+
+    enum kAudioFormatLinearPCM = 0x6C70636D; // 'lpcm'
+    enum kAudioFormatFlagIsSignedInteger = (1 << 2);
+    enum kAudioFormatFlagIsPacked        = (1 << 3);
+
+    struct AudioStreamBasicDescription {
+        double mSampleRate;
+        uint mFormatID;
+        uint mFormatFlags;
+        uint mBytesPerPacket;
+        uint mFramesPerPacket;
+        uint mBytesPerFrame;
+        uint mChannelsPerFrame;
+        uint mBitsPerChannel;
+        uint mReserved;
+    }
+
+    struct AudioQueueBuffer {
+        uint mAudioDataBytesCapacity;
+        void* mAudioData;
+        uint mAudioDataByteSize;
+        void* mUserData;
+        uint mPacketDescriptionCapacity;
+        void* mPacketDescriptions;
+        uint mPacketDescriptionCount;
+    }
+
+    alias AudioQueueRef = void*;
+    alias AudioQueueBufferRef = AudioQueueBuffer*;
+    alias AudioQueueOutputCallback = extern(C) void function(void* inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer);
+
+    extern(C) int AudioQueueNewOutput(const AudioStreamBasicDescription* inFormat, AudioQueueOutputCallback inCallbackProc, void* inUserData, void* inCallbackRunLoop, void* inCallbackRunLoopMode, uint inFlags, AudioQueueRef* outAQ);
+    extern(C) int AudioQueueAllocateBuffer(AudioQueueRef inAQ, uint inBufferByteSize, AudioQueueBufferRef* outBuffer);
+    extern(C) int AudioQueueEnqueueBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBuffer, uint inNumPacketDescs, const void* inPacketDescs);
+    extern(C) int AudioQueueStart(AudioQueueRef inAQ, const void* inStartTime);
+    extern(C) int AudioQueueStop(AudioQueueRef inAQ, bool inImmediate);
+    extern(C) int AudioQueueDispose(AudioQueueRef inAQ, bool inImmediate);
+    extern(C) int AudioQueueFreeBuffer(AudioQueueRef inAQ, AudioQueueBufferRef inBuffer);
+    extern(C) int AudioQueuePause(AudioQueueRef inAQ);
+
+    extern(C) static void macCallback(void* userData, AudioQueueRef handle, AudioQueueBufferRef buffer) {
+        import core.stdc.string : memset;
+        AudioOutput* ao = cast(AudioOutput*) userData;
+        int expectedLen = 2048; // BUFFER_SIZE_SHORT explicitly, preventing bounds crash in fillData
+        if(ao.playing) {
+            ao.fillData( (cast(short*) buffer.mAudioData)[0 .. expectedLen] );
+        } else {
+            memset(buffer.mAudioData, 0, expectedLen * short.sizeof);
+        }
+        buffer.mAudioDataByteSize = expectedLen * cast(uint)short.sizeof;
+        AudioQueueEnqueueBuffer(handle, buffer, 0, null);
+    }
+}
 
 version(ALSA) {
 	// this is the virtual rawmidi device on my computer at least
@@ -2163,7 +2220,7 @@ struct AudioInput {
 	} else version(WinMM) {
 		HWAVEIN handle;
 		HANDLE event;
-	} else static assert(0);
+	} else version(MacAudio) { void* handle; } else static assert(0);
 
 	@disable this();
 	@disable this(this);
@@ -2207,7 +2264,7 @@ struct AudioInput {
 			if(auto err = waveInOpen(&handle, WAVE_MAPPER, &format, cast(DWORD_PTR) event, cast(DWORD_PTR) &this, CALLBACK_EVENT))
 				throw new WinMMException("wave in open", err);
 
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	/// Data is delivered as interleaved stereo, LE 16 bit, 44.1 kHz
@@ -2320,7 +2377,7 @@ struct AudioInput {
 				}
 
 			ResetEvent(event);
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	private bool recording;
@@ -2337,7 +2394,7 @@ struct AudioInput {
 			// in wine (though not Windows nor winedbg as far as I can tell)
 			// this randomly segfaults. the sleep prevents it. idk why.
 			Sleep(5);
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 }
 
@@ -2350,6 +2407,8 @@ struct AudioOutput {
 		snd_pcm_t* handle;
 	} else version(WinMM) {
 		HWAVEOUT handle;
+	} else version(MacAudio) {
+		AudioQueueRef handle;
 	}
 
 	@disable this();
@@ -2508,6 +2567,29 @@ struct AudioOutput {
 			foreach(ref header; headers)
 				if(auto err = waveOutUnprepareHeader(handle, &header, header.sizeof))
 					throw new WinMMException("unprepare", err);
+		} else version(MacAudio) {
+			AudioQueueBufferRef[8] buffers;
+			int expectedBytes = 2048 * cast(int)short.sizeof;
+			foreach(ref buffer; buffers) {
+				AudioQueueAllocateBuffer(handle, expectedBytes, &buffer);
+				buffer.mUserData = cast(void*) &this;
+				fillData( (cast(short*) buffer.mAudioData)[0 .. 2048] );
+				buffer.mAudioDataByteSize = expectedBytes;
+				AudioQueueEnqueueBuffer(handle, buffer, 0, null);
+			}
+
+			AudioQueueStart(handle, null);
+
+			import core.thread : Thread;
+			import core.time : msecs;
+			while(playing) {
+				Thread.sleep(10.msecs);
+			}
+
+			AudioQueueStop(handle, true);
+			foreach(ref buffer; buffers) {
+				AudioQueueFreeBuffer(handle, buffer);
+			}
 		} else static assert(0);
 
 		close();
@@ -2524,6 +2606,8 @@ struct AudioOutput {
 			waveOutPause(handle);
 		else version(ALSA)
 			snd_pcm_pause(handle, 1);
+		else version(MacAudio)
+			AudioQueuePause(handle);
 	}
 
 	///
@@ -2532,6 +2616,8 @@ struct AudioOutput {
 			waveOutRestart(handle);
 		else version(ALSA)
 			snd_pcm_pause(handle, 0);
+		else version(MacAudio)
+			AudioQueueStart(handle, null);
 
 	}
 
@@ -2573,6 +2659,20 @@ struct AudioOutput {
 			format.cbSize = 0;
 			if(auto err = waveOutOpen(&handle, WAVE_MAPPER, &format, cast(DWORD_PTR) &mmCallback, cast(DWORD_PTR) &this, CALLBACK_FUNCTION))
 				throw new WinMMException("wave out open", err);
+		} else version(MacAudio) {
+			AudioStreamBasicDescription format;
+			format.mSampleRate = SampleRate;
+			format.mFormatID = kAudioFormatLinearPCM;
+			format.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+			format.mFramesPerPacket = 1;
+			format.mChannelsPerFrame = channels;
+			format.mBitsPerChannel = 16;
+			format.mBytesPerFrame = format.mChannelsPerFrame * (format.mBitsPerChannel / 8);
+			format.mBytesPerPacket = format.mBytesPerFrame * format.mFramesPerPacket;
+
+			auto err = AudioQueueNewOutput(&format, &macCallback, cast(void*) &this, null, null, 0, &handle);
+			if(err != 0)
+				throw new Exception("AudioQueueNewOutput failed");
 		} else static assert(0);
 	}
 
@@ -2591,6 +2691,9 @@ struct AudioOutput {
 			handle = null;
 		} else version(WinMM) {
 			waveOutClose(handle);
+			handle = null;
+		} else version(MacAudio) {
+			AudioQueueDispose(handle, true);
 			handle = null;
 		} else static assert(0);
 	}
@@ -2644,7 +2747,7 @@ B0 40 00 # sustain pedal off
 		} else version(WinMM) {
 			if(auto err = midiInOpen(&handle, 0, cast(DWORD_PTR) &mmCallback, cast(DWORD_PTR) &this, CALLBACK_FUNCTION))
 				throw new WinMMException("midi in open", err);
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	private bool recording = false;
@@ -2694,7 +2797,7 @@ B0 40 00 # sustain pedal off
 			while(recording) {
 				Sleep(1);
 			}
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	version(WinMM)
@@ -2721,7 +2824,7 @@ B0 40 00 # sustain pedal off
 			snd_rawmidi_close(handle);
 		} else version(WinMM) {
 			midiInClose(handle);
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 }
 
@@ -2731,6 +2834,8 @@ struct MidiOutput {
 		snd_rawmidi_t* handle;
 	} else version(WinMM) {
 		HMIDIOUT handle;
+	} else version(MacAudio) {
+		void* handle;
 	}
 
 	@disable this();
@@ -2766,7 +2871,7 @@ struct MidiOutput {
 		} else version(WinMM) {
 			if(auto err = midiOutOpen(&handle, 0, 0, 0, CALLBACK_NULL))
 				throw new WinMMException("midi out open", err);
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	void silenceAllNotes() {
@@ -2787,7 +2892,7 @@ struct MidiOutput {
 		} else version(WinMM) {
 			if(auto error = midiOutReset(handle))
 				throw new WinMMException("midi reset", error);
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	/// Writes a single low-level midi message
@@ -2813,7 +2918,7 @@ struct MidiOutput {
 			DWORD word = (param2 << 16) | (param1 << 8) | status;
 			if(auto error = midiOutShortMsg(handle, word))
 				throw new WinMMException("midi out", error);
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 
 	}
 
@@ -2844,7 +2949,7 @@ struct MidiOutput {
 					data = data[3 .. $];
 				}
 			}
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	~this() {
@@ -2853,7 +2958,7 @@ struct MidiOutput {
 			snd_rawmidi_close(handle);
 		} else version(WinMM) {
 			midiOutClose(handle);
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 }
 
@@ -2936,7 +3041,7 @@ struct AudioMixer {
 				addFileEventListeners(getAlsaFileDescriptors()[0], &eventListener, null, null);
 				setAlsaElemCallback(&alsaCallback);
 			}
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	~this() {
@@ -2947,7 +3052,7 @@ struct AudioMixer {
 			}
 			snd_mixer_selem_id_free(sid);
 			snd_mixer_close(handle);
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	version(ALSA)
@@ -2977,7 +3082,7 @@ struct AudioMixer {
 			if(auto err = snd_mixer_selem_get_playback_switch(selem, 0, &result))
 				throw new AlsaException("get mute state", err);
 			return result == 0;
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	/// Mutes or unmutes the master channel
@@ -2986,7 +3091,7 @@ struct AudioMixer {
 		version(ALSA) {
 			if(auto err = snd_mixer_selem_set_playback_switch_all(selem, mute ? 0 : 1))
 				throw new AlsaException("set mute state", err);
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	/// returns a percentage, between 0 and 100 (inclusive)
@@ -2994,7 +3099,7 @@ struct AudioMixer {
 		version(ALSA) {
 			auto volume = getMasterVolumeExact();
 			return cast(int)(volume * 100 / (maxVolume - minVolume));
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	/// Gets the exact value returned from the operating system. The range may vary.
@@ -3003,7 +3108,7 @@ struct AudioMixer {
 			c_long volume;
 			snd_mixer_selem_get_playback_volume(selem, 0, &volume);
 			return cast(int)volume;
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	/// sets a percentage on the volume, so it must be 0 <= volume <= 100
@@ -3012,7 +3117,7 @@ struct AudioMixer {
 		version(ALSA) {
 			assert(volume >= 0 && volume <= 100);
 			setMasterVolumeExact(cast(int)(volume * (maxVolume - minVolume) / 100));
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	/// Sets an exact volume. Must be in range of the OS provided min and max.
@@ -3020,7 +3125,7 @@ struct AudioMixer {
 		version(ALSA) {
 			if(auto err = snd_mixer_selem_set_playback_volume_all(selem, volume))
 				throw new AlsaException("set volume", err);
-		} else static assert(0);
+		} else version(MacAudio) { assert(0, "Not implemented natively on Mac"); } else static assert(0);
 	}
 
 	version(ALSA) {

@@ -1888,6 +1888,41 @@ TrueColorImage trueColorImageFromNativeHandle(PaintingHandle handle, int width =
 		DeleteDC(hdcMem);
 
 		got = i.toTrueColorImage();
+	} else version(OSXCocoa) {
+		ubyte* rawData;
+		if (auto swp = (cast(void*) handle) in SimpleWindow.nativeMapping) {
+			auto sw = *swp;
+			rawData = CGBitmapContextGetData(sw.drawingContext);
+			if(width == 0) width = sw.width;
+			if(height == 0) height = sw.height;
+		} else {
+			rawData = CGBitmapContextGetData(handle);
+			if(width == 0) width = cast(int) CGBitmapContextGetWidth(handle);
+			if(height == 0) height = cast(int) CGBitmapContextGetHeight(handle);
+		}
+
+		if(rawData !is null) {
+			got = new TrueColorImage(width, height);
+			for(long idx = 0; idx < got.imageData.bytes.length; idx += 4) {
+				auto alpha = rawData[idx + 3];
+				if(alpha == 255) {
+					got.imageData.bytes[idx + 0] = rawData[idx + 0]; // r
+					got.imageData.bytes[idx + 1] = rawData[idx + 1]; // g
+					got.imageData.bytes[idx + 2] = rawData[idx + 2]; // b
+					got.imageData.bytes[idx + 3] = rawData[idx + 3]; // a
+				} else if(alpha == 0) {
+					got.imageData.bytes[idx + 0] = 0;
+					got.imageData.bytes[idx + 1] = 0;
+					got.imageData.bytes[idx + 2] = 0;
+					got.imageData.bytes[idx + 3] = 0;
+				} else {
+					got.imageData.bytes[idx + 0] = cast(ubyte)(rawData[idx + 0] * 255 / alpha); // r
+					got.imageData.bytes[idx + 1] = cast(ubyte)(rawData[idx + 1] * 255 / alpha); // g
+					got.imageData.bytes[idx + 2] = cast(ubyte)(rawData[idx + 2] * 255 / alpha); // b
+					got.imageData.bytes[idx + 3] = rawData[idx + 3]; // a
+				}
+			}
+		}
 	} else featureNotImplemented();
 
 	return got;
@@ -2029,12 +2064,7 @@ class SimpleWindow : CapableOfHandlingNativeEvent, CapableOfBeingDrawnUpon {
 			Actually implemented on March 14, 2021
 	+/
 	TrueColorImage takeScreenshot() {
-		version(Windows)
-			return trueColorImageFromNativeHandle(impl.hwnd, _width, _height);
-		else version(OSXCocoa)
-			throw new NotYetImplementedException();
-		else
-			return trueColorImageFromNativeHandle(impl.window, _width, _height);
+			return trueColorImageFromNativeHandle(cast(void*) impl.window, _width, _height);
 	}
 
 	/++
@@ -2568,6 +2598,8 @@ class SimpleWindow : CapableOfHandlingNativeEvent, CapableOfBeingDrawnUpon {
 			return impl.window;
 		else version(Windows)
 			return impl.hwnd;
+		else version(OSXCocoa)
+			return impl.window;
 		else
 			throw new NotYetImplementedException();
 	}
@@ -5306,32 +5338,35 @@ struct EventLoopImpl {
 
 			static assert(use_arsd_core);
 
-			/+
+			NSTimer timer;
 			if (handlePulse !is null && pulseTimeout != 0) {
-				NSTimer timer = NSTimer.schedule(pulseTimeout*1e-3,
-					cast(NSid) view, sel_registerName("simpledisplay_pulse:"),
-					null, true);
-
-
-			if(timer)
-				timer.invalidate();
+				void* target;
+				foreach(k, v; SimpleWindow.nativeMapping) {
+					target = cast(void*) v.impl.view;
+					break;
+				}
+				if(target) {
+					timer = NSTimer.schedule(pulseTimeout*1e-3,
+						cast(NSid) target, sel_registerName("simpledisplay_pulse:"),
+						null, true);
+				}
 			}
-			+/
+			scope(exit) if(timer) timer.invalidate();
 
 			import arsd.core;
 			auto el = getThisThreadEventLoop(EventLoopType.Ui);
 			if(!loopInitialized) {
 				unregisters ~= el.addDelegateOnLoopIteration(&SimpleWindow.processAllCustomEvents, 3);
 				loopInitialized = true;
-				sdpyPrintDebugString("one");
 				NSApp.run();
-				sdpyPrintDebugString("here");
 			}
 
-				sdpyPrintDebugString("arsd.core loop starting");
-			el.run(() => !whileCondition());
+			if(whileCondition is null)
+				whileCondition = () => true;
 
-				sdpyPrintDebugString("kiio all done");
+			el.run(delegate () {
+				return !whileCondition();
+			});
 
 			return 0;
 		} else {
@@ -6347,35 +6382,62 @@ class Timer {
 
 			mapping[handle] = this;
 
-		} else version(Emscripten) {
-		} else version(linux) {
-			static import ep = core.sys.linux.epoll;
-
-			import core.sys.linux.timerfd;
-
-			fd = timerfd_create(CLOCK_MONOTONIC, 0);
-			if(fd == -1)
-				throw new Exception("timer create failed");
-
-			mapping[fd] = this;
-
-			itimerspec value = makeItimerspec(intervalInMilliseconds);
-
-			if(timerfd_settime(fd, 0, &value, null) == -1)
-				throw new Exception("couldn't make pulse timer");
-
-			version(with_eventloop) {
-				import arsd.eventloop;
-				addFileEventListeners(fd, &trigger, null, null);
-			} else {
-				prepareEventLoop();
-
-				ep.epoll_event ev = void;
-				ev.events = ep.EPOLLIN;
-				ev.data.fd = fd;
-				ep.epoll_ctl(epollFd, ep.EPOLL_CTL_ADD, fd, &ev);
-			}
+		} else version(OSXCocoa) {
+			// We use a simple CFRunLoopTimer for the heartbeat
+			mapping[cast(void*)this] = this;
+			setupMacTimer(intervalInMilliseconds);
 		} else featureNotImplemented();
+	}
+
+	version(OSXCocoa) {
+		void* timerRef;
+		
+		extern(C) {
+			alias CFRunLoopTimerRef = void*;
+			alias CFRunLoopRef = void*;
+			alias CFStringRef = void*;
+			alias CFAbsoluteTime = double;
+			alias CFTimeInterval = double;
+			alias CFRunLoopTimerCallBack = extern(C) void function(CFRunLoopTimerRef timer, void* info);
+			struct CFRunLoopTimerContext {
+				long version_;
+				void* info;
+				void* retain;
+				void* release;
+				void* copyDescription;
+			}
+			
+			CFRunLoopTimerRef CFRunLoopTimerCreate(void* allocator, CFAbsoluteTime fireDate, CFTimeInterval interval, uint flags, int order, CFRunLoopTimerCallBack callout, CFRunLoopTimerContext* context) @nogc;
+			void CFRunLoopAddTimer(CFRunLoopRef rl, CFRunLoopTimerRef timer, CFStringRef mode) @nogc;
+			CFRunLoopRef CFRunLoopGetCurrent() @nogc;
+			void CFRunLoopTimerInvalidate(CFRunLoopTimerRef timer) @nogc;
+			CFAbsoluteTime CFAbsoluteTimeGetCurrent() @nogc;
+			void CFRelease(void* obj) @nogc;
+		}
+
+		void setupMacTimer(int ms) {
+			if(timerRef) {
+				CFRunLoopTimerInvalidate(cast(CFRunLoopTimerRef)timerRef);
+				CFRelease(timerRef);
+			}
+			
+			if(ms <= 0) {
+				timerRef = null;
+				return;
+			}
+
+			CFRunLoopTimerContext context;
+			context.info = cast(void*)this;
+			
+			timerRef = CFRunLoopTimerCreate(null, CFAbsoluteTimeGetCurrent() + (cast(double)ms/1000.0), (cast(double)ms/1000.0), 0, 0, &macTimerCallback, &context);
+			CFRunLoopAddTimer(CFRunLoopGetCurrent(), cast(CFRunLoopTimerRef)timerRef, null); 
+		}
+
+		extern(C) static void macTimerCallback(void* timer, void* info) {
+			if(auto t = cast(Timer)info) {
+				t.onPulse();
+			}
+		}
 	}
 
 	private int intervalInMilliseconds;
@@ -6455,6 +6517,8 @@ class Timer {
 			if(timerfd_settime(fd, 0, &value, null) == -1) {
 				throw new Exception("couldn't change pulse timer");
 			}
+		} else version(OSXCocoa) {
+			setupMacTimer(intervalInMilliseconds);
 		} else {
 			assert(false, "Timer.changeTime(int) is not implemented for this platform");
 		}
@@ -9989,7 +10053,7 @@ private inout(char)[] sliceCString(inout(char)* s) {
 }
 
 version(OSXCocoa)
-	alias PaintingHandle = NSObject;
+	alias PaintingHandle = void*;
 else
 	alias PaintingHandle = NativeWindowHandle;
 
@@ -10077,7 +10141,6 @@ struct ScreenPainter {
 		originalPen = impl._activePen;
 		originalFillColor = impl._fillColor;
 		originalClipRectangle = impl._clipRectangle;
-		version(OSXCocoa) {} else
 		originalFont = impl._activeFont;
 	}
 
@@ -10241,7 +10304,7 @@ struct ScreenPainter {
 			// FIXME: clip stuff outside this rectangle
 			XCopyArea(impl.display, impl.d, impl.d, impl.gc, upperLeft.x, upperLeft.y, width, height, upperLeft.x - dx, upperLeft.y - dy);
 		} else version(OSXCocoa) {
-			throw new NotYetImplementedException();
+			impl.scrollArea(upperLeft, width, height, dx, dy);
 		} else static assert(0);
 	}
 
@@ -19643,7 +19706,8 @@ struct Visual
 		override void drawRect(NSRect rect) @selector("drawRect:") {
 			auto curCtx = NSGraphicsContext.currentContext.graphicsPort;
 			auto cgImage = CGBitmapContextCreateImage(simpleWindow.drawingContext);
-			auto size = CGSize(CGBitmapContextGetWidth(simpleWindow.drawingContext), CGBitmapContextGetHeight(simpleWindow.drawingContext));
+			// Render the physical 2x buffer down onto the 1x logical viewport bounds!
+			auto size = CGSize(simpleWindow.width, simpleWindow.height);
 			CGContextDrawImage(curCtx, CGRect(CGPoint(0, 0), size), cgImage);
 			CGImageRelease(cgImage);
 		}
@@ -19653,6 +19717,10 @@ struct Visual
 			MouseEvent me;
 			me.type = type;
 
+			if(simpleWindow is null) {
+				sdpyPrintDebugString("simpleWindow is null!");
+				return;
+			}
 			auto pos = event.locationInWindow;
 
 			me.x = cast(int) pos.x;
@@ -19667,10 +19735,19 @@ struct Visual
 			me.modifierState = cast(uint) event.modifierFlags;
 			me.window = simpleWindow;
 
+			// In cocoa, we query Native NSEvent's clickCount attribute safely!
 			me.doubleClick = false;
+			if (type == MouseEventType.buttonPressed || type == MouseEventType.buttonReleased) {
+				if (button == MouseButton.left || button == MouseButton.right || button == MouseButton.middle) {
+					me.doubleClick = (event.clickCount >= 2);
+				}
+			}
 
-			if(simpleWindow && simpleWindow.handleMouseEvent)
+			if(simpleWindow.handleMouseEvent) {
+				// sdpyPrintDebugString("calling mouse handler...");
 				simpleWindow.handleMouseEvent(me);
+				// sdpyPrintDebugString("returned from mouse handler");
+			}
 		}
 
 		override void mouseDown(NSEvent event) @selector("mouseDown:") {
@@ -19685,7 +19762,7 @@ struct Visual
 			mouseHelper(event, MouseEventType.buttonReleased, MouseButton.left);
 		}
 		override void mouseMoved(NSEvent event) @selector("mouseMoved:") {
-			mouseHelper(event, MouseEventType.motion, MouseButton.left); // button wrong prolly
+			mouseHelper(event, MouseEventType.motion, cast(MouseButton)0); 
 		}
 		/+
 			// FIXME
@@ -19718,7 +19795,13 @@ struct Visual
 		}
 
 		override void scrollWheel(NSEvent event) @selector("scrollWheel:") {
-			// import std.stdio; writeln(event.deltaY);
+			if (event.deltaY > 0) {
+				mouseHelper(event, MouseEventType.buttonPressed, MouseButton.wheelUp);
+				mouseHelper(event, MouseEventType.buttonReleased, MouseButton.wheelUp);
+			} else if (event.deltaY < 0) {
+				mouseHelper(event, MouseEventType.buttonPressed, MouseButton.wheelDown);
+				mouseHelper(event, MouseEventType.buttonReleased, MouseButton.wheelDown);
+			}
 		}
 
 		override void keyDown(NSEvent event) @selector("keyDown:") {
@@ -19773,7 +19856,7 @@ private:
 	alias const(void)* CGColorSpaceRef;
 	alias const(void)* CGImageRef;
 	alias ulong CGBitmapInfo;
-	alias NSGraphicsContext CGContextRef; // actually CGContextRef should be a subclass...
+	alias void* CGContextRef;
 
 	alias NSPoint CGPoint;
 	alias NSSize CGSize;
@@ -19869,6 +19952,7 @@ private:
 		void CGContextSetTextMatrix(CGContextRef c, CGAffineTransform t);
 
 		void CGImageRelease(CGImageRef image);
+		CGImageRef CGImageCreateWithImageInRect(CGImageRef image, CGRect rect);
 	}
 } else static assert(0, "Unsupported operating system");
 
@@ -19979,19 +20063,19 @@ version(OSXCocoa) {
 		Pen _activePen;
 		Color _fillColor;
 		Rectangle _clipRectangle;
-		OperatingSystemFont _font;
+		OperatingSystemFont _activeFont;
 
 		OperatingSystemFont getFont() {
-			if(_font is null) {
+			if(_activeFont is null) {
 				static OperatingSystemFont _defaultFont;
 				if(_defaultFont is null) {
 					_defaultFont = new OperatingSystemFont();
 					_defaultFont.loadDefault();
 				}
-				_font = _defaultFont;
+				_activeFont = _defaultFont;
 			}
 
-			return _font;
+			return _activeFont;
 		}
 
 		void create(PaintingHandle window) {
@@ -20009,6 +20093,23 @@ version(OSXCocoa) {
 		}
 
 		bool manualInvalidations;
+		void scrollArea(Point upperLeft, int width, int height, int dx, int dy) {
+			if(context is null) return;
+
+			auto fullImage = CGBitmapContextCreateImage(context);
+			if(fullImage is null) return;
+			scope(exit) CGImageRelease(fullImage);
+
+			CGRect srcRect = CGRect(CGPoint(upperLeft.x, upperLeft.y), CGSize(width, height));
+			auto subImage = CGImageCreateWithImageInRect(fullImage, srcRect);
+			if(subImage is null) return;
+			scope(exit) CGImageRelease(subImage);
+
+			CGRect destRect = CGRect(CGPoint(upperLeft.x - dx, upperLeft.y - dy), CGSize(width, height));
+			CGContextDrawImage(context, destRect, subImage);
+
+			if(view) view.setNeedsDisplay(true);
+		}
 		void invalidateRect(Rectangle invalidRect) { }
 
 		// NotYetImplementedException
@@ -20022,7 +20123,7 @@ version(OSXCocoa) {
 		}
 
 		void setFont(OperatingSystemFont font) {
-			_font = font;
+			_activeFont = font;
 			// font.font.setInContext(context);
 			if(font) {
 				// FIXME: should i free this thing?
@@ -20327,13 +20428,18 @@ version(OSXCocoa) {
 				//window.setIsVisible = false;
 			}
 		}
-
+		
 		void createNewDrawingContext(int width, int height) {
 			// FIXME need to preserve info from the old context too i think... maybe. or at least setNeedsDisplay
 			if(this.drawingContext)
 				CGContextRelease(this.drawingContext);
 			auto colorSpace = CGColorSpaceCreateDeviceRGB();
-			this.drawingContext = CGBitmapContextCreate(null, width, height, 8, 4*width, colorSpace, kCGImageAlphaPremultipliedLast |kCGBitmapByteOrder32Big);
+			
+			// Inject 2x Hardware Scaling Context (Retina High-DPI Matrix Vector!)
+			int scale = 2;
+			this.drawingContext = CGBitmapContextCreate(null, width * scale, height * scale, 8, 4 * width * scale, colorSpace, kCGImageAlphaPremultipliedLast |kCGBitmapByteOrder32Big);
+			CGContextScaleCTM(this.drawingContext, scale, scale);
+			
 			CGColorSpaceRelease(colorSpace);
 			CGContextSelectFont(drawingContext, "Lucida Grande", 12.0f, 1);
 			auto matrix = CGContextGetTextMatrix(drawingContext);
@@ -20353,7 +20459,7 @@ version(OSXCocoa) {
 		}
 
 		ScreenPainter getPainter(bool manualInvalidations) {
-			return ScreenPainter(this, this.window, manualInvalidations);
+			return ScreenPainter(this, cast(void*) this.window, manualInvalidations);
 		}
 
 		NSWindow window;
@@ -20361,6 +20467,8 @@ version(OSXCocoa) {
 		CGContextRef drawingContext;
 	}
 }
+
+extern(C) void CGContextScaleCTM(CGContextRef c, double sx, double sy) nothrow @nogc;
 
 version(without_opengl) {} else
 extern(System) nothrow @nogc {

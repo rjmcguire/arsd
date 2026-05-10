@@ -6010,6 +6010,18 @@ class Timer {
 			unregisterToken = el.addCallbackOnFdReadable(fd, new CallbackHelper(&trigger));
 		} else version(Arsd_core_kqueue) {
 			this.ident = ++identTicker;
+		} else version(Arsd_core_dispatch) {
+			// Create a GCD timer source on the main queue.
+			// We don't arm it yet — changeTimeInternal does that.
+			dispatchSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+			if(dispatchSource is null)
+				throw new Exception("dispatch_source_create(TIMER) failed");
+			// Wrap trigger() in a GCD block so it fires on the main queue
+			import core.memory : GC;
+			auto b = block(() { this.trigger(); });
+			GC.addRoot(b);
+			dispatchBlock = b;
+			dispatch_source_set_event_handler(dispatchSource, b);
 		} else throw new NotYetImplementedException();
 		// FIXME: freebsd 12 has timer_fd and netbsd 10 too
 	}
@@ -6056,6 +6068,29 @@ class Timer {
 
 			EV_SET(&ev, this.ident, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_CLEAR | (repeats ? 0 : EV_ONESHOT), NOTE_USECONDS, 1000 * intervalInMilliseconds, cast(void*) cbh);
 			ErrnoEnforce!kevent(el.kqueuefd, &ev, 1, null, 0, null);
+		} else version(Arsd_core_dispatch) {
+			if(intervalInMilliseconds == 0) {
+				// pause() / cancel() - suspend the source so it stops firing
+				if(dispatchSourceRunning) {
+					dispatch_suspend(dispatchSource);
+					dispatchSourceRunning = false;
+				}
+			} else {
+				// Convert milliseconds to nanoseconds for GCD
+				ulong intervalNs = cast(ulong) intervalInMilliseconds * 1_000_000UL;
+				ulong leewayNs   = intervalNs / 10; // 10% leeway for power efficiency
+				// Start: fire first after one interval
+				auto startTime = dispatch_time(DISPATCH_TIME_NOW, cast(long) intervalNs);
+				dispatch_source_set_timer(dispatchSource, startTime,
+					repeats ? intervalNs : DISPATCH_TIME_FOREVER,
+					leewayNs);
+				// Only call resume the first time (or after a pause) — it is
+				// not idempotent; every resume must be paired with a suspend.
+				if(!dispatchSourceRunning) {
+					dispatch_resume(dispatchSource);
+					dispatchSourceRunning = true;
+				}
+			}
 		} else {
 			throw new NotYetImplementedException();
 		}
@@ -6140,6 +6175,17 @@ class Timer {
 			staticDestroy(fd);
 			fd = -1;
 		} else version(Arsd_core_kqueue) {
+		} else version(Arsd_core_dispatch) {
+			if(dispatchSource !is null) {
+				dispatch_source_cancel(dispatchSource);
+				dispatch_release(dispatchSource);
+				import core.memory : GC;
+				if(dispatchBlock !is null)
+					GC.removeRoot(dispatchBlock);
+				dispatchSource = null;
+				dispatchBlock = null;
+				dispatchSourceRunning = false;
+			}
 		} else throw new NotYetImplementedException();
 	}
 
@@ -6151,6 +6197,13 @@ class Timer {
 			cleanupQueue.queue!unregister(unregisterToken);
 			if(fd != -1)
 				cleanupQueue.queue!staticDestroy(fd);
+		} else version(Arsd_core_dispatch) {
+			// Best effort cleanup from GC finalizer — may not be on main thread,
+			// but cancel is thread-safe for dispatch sources.
+			if(dispatchSource !is null) {
+				dispatch_source_cancel(dispatchSource);
+				dispatchSource = null;
+			}
 		}
 	}
 
@@ -6214,6 +6267,8 @@ class Timer {
 				return; // never try to actually run faster than the event loop
 			lastEventLoopRoundTriggered = eventLoopRound;
 		} else version(Arsd_core_kqueue) {
+		} else version(Arsd_core_dispatch) {
+			// GCD fires our block directly — nothing to clear here.
 		} else throw new NotYetImplementedException();
 
 		if(onPulse)
@@ -6239,6 +6294,10 @@ class Timer {
 		int ident;
 		static int identTicker;
 		CallbackHelper cbh;
+	} else version(Arsd_core_dispatch) {
+		dispatch_source_t dispatchSource;
+		ObjCBlock!(void)* dispatchBlock;
+		bool dispatchSourceRunning;
 	} else static if(UseCocoa) {
 	} else static assert(0, "timer not supported");
 }
@@ -11570,6 +11629,7 @@ package(arsd) version(Windows) extern(Windows) {
 	int WSARecvFrom(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, sockaddr*, LPINT, LPOVERLAPPED, LPOVERLAPPED_COMPLETION_ROUTINE);
 }
 
+
 package(arsd) version(UseCocoa) {
 
 /* Copy/paste chunk from Jacob Carlborg { */
@@ -11675,22 +11735,33 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 		// this is called plain `id` in objective C but i fear mistakes with that in D. like sure it is a type instead of a variable like most things called id but i still think it is weird. i might change my mind later.
 		alias void* NSid; // FIXME? the docs say this is a pointer to an instance of a class, but that is not necessary a child of NSObject
 
+		extern(Objective-C)
 		extern class NSObject {
 			static NSObject alloc() @selector("alloc");
+
 			NSObject init() @selector("init");
 
-			void retain() @selector("retain");
+			NSObject copy() @selector("copy");
+
 			void release() @selector("release");
-			void autorelease() @selector("autorelease");
+			NSObject retain() @selector("retain");
+
+			NSObject autorelease() @selector("autorelease");
+
+			NSString description() @selector("description");
+
+			bool isKindOfClass(void*) @selector("isKindOfClass:"); // FIXME can i use the class symbol here?
 
 			void performSelectorOnMainThread(SEL aSelector, NSid arg, bool waitUntilDone) @selector("performSelectorOnMainThread:withObject:waitUntilDone:");
 		}
 
 		// this is some kind of generic in objc...
+		extern(Objective-C)
 		extern class NSArray : NSObject {
 			static NSArray arrayWithObjects(NSid* objects, NSUInteger count) @selector("arrayWithObjects:count:");
 		}
 
+		extern(Objective-C)
 		extern class NSString : NSObject {
 			override static NSString alloc() @selector("alloc");
 			override NSString init() @selector("init");
@@ -11715,6 +11786,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 		}
 
 		// FIXME: it is a generic in objc with <KeyType, ObjectType>
+		extern(Objective-C)
 		extern class NSDictionary : NSObject {
 			static NSDictionary dictionaryWithObject(NSObject object, NSid key) @selector("dictionaryWithObject:forKey:");
 			// static NSDictionary initWithObjects(NSArray objects, NSArray forKeys) @selector("initWithObjects:forKeys:");
@@ -11735,8 +11807,29 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 		}
 
 		enum NSEventType {
-			idk
-
+			leftMouseDown = 1,
+			leftMouseUp = 2,
+			rightMouseDown = 3,
+			rightMouseUp = 4,
+			mouseMoved = 5,
+			leftMouseDragged = 6,
+			rightMouseDragged = 7,
+			mouseEntered = 8,
+			mouseExited = 9,
+			keyDown = 10,
+			keyUp = 11,
+			flagsChanged = 12,
+			appKitDefined = 13,
+			systemDefined = 14,
+			applicationDefined = 15,
+			periodic = 16,
+			cursorUpdate = 17,
+			scrollWheel = 22,
+			tabletPoint = 23,
+			tabletProximity = 24,
+			otherMouseDown = 25,
+			otherMouseUp = 26,
+			otherMouseDragged = 27
 		}
 
 		enum NSEventModifierFlags : NSUInteger {
@@ -11752,6 +11845,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 		}
 
 		version(OSX)
+		extern(Objective-C)
 		extern class NSEvent : NSObject {
 			NSEventType type() @selector("type");
 
@@ -11766,7 +11860,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 			ushort specialKey() @selector("specialKey");
 
 			static NSUInteger pressedMouseButtons() @selector("pressedMouseButtons");
-			NSPoint locationInWindow() @selector("locationInWindow"); // in screen coordinates
+			// NSPoint locationInWindow() @selector("locationInWindow"); // in screen coordinates
 			static NSPoint mouseLocation() @selector("mouseLocation"); // in screen coordinates
 			NSInteger buttonNumber() @selector("buttonNumber");
 
@@ -11778,11 +11872,14 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 
 			CGFloat scrollingDeltaX() @selector("scrollingDeltaX");
 			CGFloat scrollingDeltaY() @selector("scrollingDeltaY");
+			
+			NSInteger clickCount() @selector("clickCount");
 
 			// @property(getter=isDirectionInvertedFromDevice, readonly) BOOL directionInvertedFromDevice;
 		}
 
-		extern /* final */ class NSTimer : NSObject { // the docs say don't subclass this, but making it final breaks the bridge
+		extern(Objective-C)
+		extern class NSTimer : NSObject { // the docs say don't subclass this, but making it final breaks the bridge
 			override static NSTimer alloc() @selector("alloc");
 			override NSTimer init() @selector("init");
 
@@ -11797,13 +11894,16 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 			NSid userInfo() @selector("userInfo");
 
 			NSTimeInterval tolerance() @selector("tolerance");
-			NSTimeInterval tolerance(NSTimeInterval) @selector("setTolerance:");
+			void tolerance(NSTimeInterval) @selector("setTolerance:");
 		}
 
 		alias NSTimeInterval = double;
 
 		version(OSX)
+		extern(Objective-C)
 		extern class NSResponder : NSObject {
+			override NSResponder init() @selector("init");
+
 			NSMenu menu() @selector("menu");
 			void menu(NSMenu menu) @selector("setMenu:");
 
@@ -11833,6 +11933,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 		}
 
 		version(OSX)
+		extern(Objective-C)
 		extern class NSApplication : NSResponder {
 			static NSApplication shared_() @selector("sharedApplication");
 
@@ -11868,6 +11969,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 		}
 
 		version(OSX)
+		extern(Objective-C)
 		extern class NSRunLoop : NSObject {
 			static @property NSRunLoop currentRunLoop() @selector("currentRunLoop");
 			static @property NSRunLoop mainRunLoop() @selector("mainRunLoop");
@@ -11879,6 +11981,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 		extern __gshared NSRunLoopMode NSDefaultRunLoopMode;
 
 		version(OSX)
+		extern(Objective-C)
 		extern class NSDate : NSObject {
 			static @property NSDate distantFuture() @selector("distantFuture");
 			static @property NSDate distantPast() @selector("distantPast");
@@ -11893,6 +11996,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 			bool applicationShouldTerminateAfterLastWindowClosed(NSNotification notification) @selector("applicationShouldTerminateAfterLastWindowClosed:");
 		}
 
+		extern(Objective-C)
 		extern class NSNotification : NSObject {
 			@property NSid object() @selector("object");
 		}
@@ -11908,12 +12012,14 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 			prohibited
 		}
 
+		extern(Objective-C)
 		extern class NSGraphicsContext : NSObject {
 			static NSGraphicsContext currentContext() @selector("currentContext");
-			NSGraphicsContext graphicsPort() @selector("graphicsPort");
+			void* graphicsPort() @selector("graphicsPort");
 		}
 
 		version(OSX)
+		extern(Objective-C)
 		extern class NSMenu : NSObject {
 			override static NSMenu alloc() @selector("alloc");
 
@@ -11931,6 +12037,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 		}
 
 		version(OSX)
+		extern(Objective-C)
 		extern class NSMenuItem : NSObject {
 			override static NSMenuItem alloc() @selector("alloc");
 			override NSMenuItem init() @selector("init");
@@ -11978,7 +12085,8 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 			hUDWindow = 1 << 13 // Specifies a heads up display panel
 		}
 
-		version(OSX)
+		version(OSX) {
+		extern(Objective-C)
 		extern class NSWindow : NSObject {
 			override static NSWindow alloc() @selector("alloc");
 
@@ -12015,6 +12123,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 			void setIsVisible(bool b) @selector("setIsVisible:");
 			void toggleFullScreen(NSid sender) @selector("toggleFullScreen:");
 		}
+		}
 
 		version(OSX)
 		extern interface NSWindowDelegate {
@@ -12026,9 +12135,10 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 			void windowWillClose(NSNotification notification) @selector("windowWillClose:");
 		}
 
-		version(OSX)
+		version(OSX) {
+		extern(Objective-C)
 		extern class NSView : NSResponder {
-			//override NSView init() @selector("init");
+			override NSView init() @selector("init");
 			NSView initWithFrame(NSRect frameRect) @selector("initWithFrame:");
 
 			void addSubview(NSView view) @selector("addSubview:");
@@ -12055,7 +12165,10 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 			void addSubview(NSView what) @selector("addSubview:");
 			void removeFromSuperview() @selector("removeFromSuperview");
 		}
+		}
 
+
+		extern(Objective-C)
 		extern class NSFont : NSObject {
 			void set() @selector("set"); // sets it into the current graphics context
 			void setInContext(NSGraphicsContext context) @selector("setInContext:");
@@ -12079,6 +12192,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 			// among many more
 		}
 
+		extern(Objective-C)
 		extern class NSColor : NSObject {
 			override static NSColor alloc() @selector("alloc");
 			static NSColor redColor() @selector("redColor");
@@ -12087,6 +12201,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 			CGColorRef CGColor() @selector("CGColor");
 		}
 
+		extern(Objective-C)
 		extern class CALayer : NSObject {
 			CGFloat borderWidth() @selector("borderWidth");
 			void borderWidth(CGFloat value) @selector("setBorderWidth:");
@@ -12097,6 +12212,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 
 
 		version(OSX)
+		extern(Objective-C)
 		extern class NSViewController : NSObject {
 			NSView view() @selector("view");
 			void view(NSView view) @selector("setView:");
@@ -12169,10 +12285,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 			r.size.height = h;
 			return r;
 		}
-
-
 	}
-
 	// helper raii refcount object
 	static if(UseCocoa)
 	struct MacString {
@@ -12224,12 +12337,7 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 		return NSApp_;
 	}
 
-	version(DigitalMars) {
-	// hacks to work around compiler bug
-	extern(C) __gshared void* _D4arsd4core17NSGraphicsContext7__ClassZ = null;
-	extern(C) __gshared void* _D4arsd4core6NSView7__ClassZ = null;
-	extern(C) __gshared void* _D4arsd4core8NSWindow7__ClassZ = null;
-	}
+
 
 
 
@@ -12300,17 +12408,22 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 			return &_dispatch_main_q;
 		}
 
-		// FIXME: what is dispatch_time_t ???
-		// dispatch_time
-		// dispatch_walltime
+		alias dispatch_time_t = ulong;
 
-		// void dispatch_source_set_timer(dispatch_source_t source, dispatch_time_t start, ulong interval, ulong leeway);
+		enum ulong DISPATCH_TIME_NOW = 0;
+		enum ulong DISPATCH_TIME_FOREVER = ulong.max;
+
+		dispatch_time_t dispatch_time(dispatch_time_t when, long delta);
+		dispatch_time_t dispatch_walltime(const(void)* when, long delta);
+
+		void dispatch_source_set_timer(dispatch_source_t source, dispatch_time_t start, ulong interval, ulong leeway);
+
 
 		void dispatch_retain(dispatch_object_t object);
 		void dispatch_release(dispatch_object_t object);
 
 		void dispatch_resume(dispatch_object_t object);
-		void dispatch_pause(dispatch_object_t object);
+		void dispatch_suspend(dispatch_object_t object);
 
 		void* dispatch_get_context(dispatch_object_t object);
 		void dispatch_set_context(dispatch_object_t object, void* context);
@@ -12320,5 +12433,4 @@ If you are not sure if Cocoa thinks your application is multithreaded or not, yo
 		void dispatch_async(dispatch_queue_t queue, dispatch_block_t block);
 
 	} // grand central dispatch bindings
-
 }
